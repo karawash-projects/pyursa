@@ -3,6 +3,12 @@
 All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and versions follow [SemVer](https://semver.org/).
 
+## [1.0.1] - 2026-10-21
+
+### Fixed
+- `pu.set_llm("provider:model")` stored the string instead of creating a client, so LLM steps failed
+  later; strings are now turned into clients (`pu.set_llm("gemini:gemini-3.8-flash")`).
+
 ## [1.0.0] - 2026-10-21
 
 First stable release. Same code as 1.0.0rc6; the public API now follows SemVer (see docs/stability.md).

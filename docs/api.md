@@ -2,7 +2,7 @@
 
 _Generated from the code by `scripts/gen_api_docs.py`; do not edit by hand._
 
-Version 1.0.0.
+Version 1.0.1.
 
 ## Creating frames
 
@@ -364,9 +364,10 @@ Constants: `pu.Int64`, `pu.Float64`, `pu.String`, `pu.Boolean`, `pu.Date`, `pu.D
 
 ## LLM operators
 
-### `pu.set_llm(client: LLMClient | None = None, *, cache_path: str | None = None, max_rows: int | None = None, batch_size: int | None = None, concurrency: int | None = None, max_input_tokens: int | None = None, price_per_mtok: tuple[float, float] | None = None, redact_pii: bool | None = None) -> None`
+### `pu.set_llm(client: LLMClient | str | None = None, *, cache_path: str | None = None, max_rows: int | None = None, batch_size: int | None = None, concurrency: int | None = None, max_input_tokens: int | None = None, price_per_mtok: tuple[float, float] | None = None, redact_pii: bool | None = None) -> None`
 
 Configure the default model used by llm_* operators and its limits.
+`client` is a client object or a "provider:model" string such as "gemini:gemini-3.8-flash".
 
 ### `pu.llm_client(spec: str, **kwargs: Any) -> PromptClient`
 

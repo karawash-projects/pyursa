@@ -272,10 +272,14 @@ CONFIG = LLMConfig()
 _LOCAL = threading.local()
 
 
-def set_llm(client: LLMClient | None = None, *, cache_path: str | None = None, max_rows: int | None = None,
+def set_llm(client: LLMClient | str | None = None, *, cache_path: str | None = None, max_rows: int | None = None,
             batch_size: int | None = None, concurrency: int | None = None, max_input_tokens: int | None = None,
             price_per_mtok: tuple[float, float] | None = None, redact_pii: bool | None = None) -> None:
-    """Configure the default model used by llm_* operators and its limits."""
+    """Configure the default model used by llm_* operators and its limits.
+    `client` is a client object or a "provider:model" string such as "gemini:gemini-3.8-flash"."""
+    if isinstance(client, str):
+        from .providers import llm_client
+        client = llm_client(client)
     if client is not None:
         CONFIG.client = client
     if cache_path is not None:
