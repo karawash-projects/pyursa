@@ -1,0 +1,6 @@
+# Oldest dependency versions tested in CI (from the compatibility matrix).
+pyarrow==15.0.0
+numpy<2
+polars==1.30.0
+duckdb==1.2.0
+mcp==1.21.1

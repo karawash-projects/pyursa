@@ -1,0 +1,21 @@
+site_name: pyursa
+site_description: Engine-agnostic dataframes for agentic AI
+repo_url: https://github.com/karawash-projects/pyursa
+theme:
+  name: material
+  features: [navigation.sections, content.code.copy]
+nav:
+  - Home: index.md
+  - User guide: guide.md
+  - Types: types.md
+  - Agents and MCP: agents.md
+  - LLM operators: llm.md
+  - LLM providers: providers.md
+  - Semantics: semantics.md
+  - API reference: api.md
+  - Security: security.md
+  - Stability policy: stability.md
+markdown_extensions:
+  - admonition
+  - tables
+  - pymdownx.superfences
