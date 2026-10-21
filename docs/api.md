@@ -2,7 +2,7 @@
 
 _Generated from the code by `scripts/gen_api_docs.py`; do not edit by hand._
 
-Version 1.0.0rc5.
+Version 1.0.0rc6.
 
 ## Creating frames
 

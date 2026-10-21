@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pyursa"
-version = "1.0.0rc5"
+version = "1.0.0rc6"
 description = "Engine-agnostic dataframes for agentic AI: strict types, identical results on Polars and DuckDB, structured errors, undo, lineage, LLM operators and an MCP server."
 readme = "README.md"
 requires-python = ">=3.10"

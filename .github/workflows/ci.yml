@@ -45,6 +45,19 @@ jobs:
       - name: End-to-end script
         run: python scripts/e2e.py --rows 50000
 
+  prerelease-dependencies:
+    name: test (newest pre-release dependencies)
+    runs-on: ubuntu-latest
+    continue-on-error: true  # early warning about upstream changes; doesn't block merges
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install --pre --upgrade -e ".[dev]"
+      - run: pip list
+      - run: python -m pytest -q
+
   minimum-versions:
     name: test (oldest supported dependencies)
     runs-on: ubuntu-latest

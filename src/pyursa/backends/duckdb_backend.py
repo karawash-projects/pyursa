@@ -477,8 +477,12 @@ class DuckDBBackend(Backend):
                 con.execute("SET disabled_optimizers = 'filter_pushdown'")
             for name, table in c.tables.items():
                 con.register(name, table)
-            res = con.execute(sql, params) if params else con.execute(sql)
-            # duckdb >= 1.5 has to_arrow_table(); older releases call it fetch_arrow_table()
-            return res.to_arrow_table() if hasattr(res, "to_arrow_table") else res.fetch_arrow_table()
+            for method in ("to_arrow_table", "fetch_arrow_table"):  # duckdb >= 1.5 / older 1.x
+                if hasattr(con, method):
+                    res = con.execute(sql, params) if params else con.execute(sql)
+                    return getattr(res, method)()
+            # duckdb 2.0 previews removed Arrow fetching from the connection; relations still have it
+            rel = con.sql(sql, params=params) if params else con.sql(sql)
+            return rel.to_arrow_table()
         finally:
             con.close()

@@ -3,6 +3,17 @@
 All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and versions follow [SemVer](https://semver.org/).
 
+## [1.0.0rc6] - 2026-10-21
+
+### Fixed
+- The DuckDB backend failed with DuckDB 2.0 previews, which removed Arrow fetching from connections
+  (`pip install --pre` pulls those previews in). Results are now fetched through a relation when needed;
+  the full test suite passes on DuckDB 2.0 previews, Polars 2.0 and PyArrow 26.
+
+### Added
+- CI job that runs the tests against the newest pre-release dependencies, to catch breaking upstream
+  changes before they ship.
+
 ## [1.0.0rc5] - 2026-10-20
 
 ### Fixed
