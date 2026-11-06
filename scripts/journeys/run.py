@@ -24,6 +24,11 @@ from _harness import Journey, StopJourney  # noqa: E402
 
 
 def main() -> int:
+    for stream in (sys.stdout, sys.stderr):  # Windows consoles default to a code page without ✗
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     ap = argparse.ArgumentParser()
     ap.add_argument("journeys", nargs="*")
     ap.add_argument("-v", "--verbose", action="store_true")

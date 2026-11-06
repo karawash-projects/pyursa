@@ -13,7 +13,6 @@ import asyncio
 import json
 import math
 import os
-import sys
 from pathlib import Path
 
 import pyarrow as pa
@@ -25,12 +24,9 @@ from _harness import Journey, Skip, check, equal
 
 
 def server_command() -> str:
-    """The installed `pyursa-mcp` console script next to this interpreter (as a desktop client runs it)."""
-    bindir = Path(sys.executable).parent
-    for name in ("pyursa-mcp", "pyursa-mcp.exe"):
-        if (bindir / name).exists():
-            return str(bindir / name)
-    raise AssertionError(f"pyursa-mcp console script not found in {bindir}; is pyursa[mcp] installed?")
+    """The installed `pyursa-mcp` console script for this interpreter (as a desktop client runs it)."""
+    from _harness import console_script
+    return str(console_script("pyursa-mcp"))
 
 
 def import_client():

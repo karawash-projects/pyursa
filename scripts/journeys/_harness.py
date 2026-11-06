@@ -72,3 +72,20 @@ def same_table(a, b) -> bool:
     norm = lambda v: ("NaN",) if isinstance(v, float) and v != v else v  # noqa: E731
     return all([norm(v) for v in a.column(i).to_pylist()] == [norm(v) for v in b.column(i).to_pylist()]
                for i in range(a.num_columns))
+
+
+def console_script(name: str):
+    """Path of an installed console script for this interpreter (bin/ on Unix, Scripts\\ on Windows)."""
+    import sys
+    import sysconfig
+    from pathlib import Path
+    dirs = [Path(sysconfig.get_path("scripts")), Path(sys.executable).parent, Path(sys.executable).parent / "Scripts"]
+    try:
+        dirs.append(Path(sysconfig.get_path("scripts", f"{__import__('os').name}_user")))
+    except KeyError:
+        pass
+    for d in dirs:
+        for cand in (d / name, d / f"{name}.exe"):
+            if cand.exists():
+                return cand
+    raise AssertionError(f"{name} console script not found in {', '.join(map(str, dirs))}; is pyursa[mcp] installed?")

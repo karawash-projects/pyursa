@@ -85,7 +85,7 @@ jobs:
           else
             pip install "${WHEEL}[all,mcp]" pandas numpy
           fi
-          echo "PYURSA_WHEEL=$(pwd)/${WHEEL}" >> "$GITHUB_ENV"
+          echo "PYURSA_WHEEL=$(python -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve())' "${WHEEL}")" >> "$GITHUB_ENV"
       - name: Run the journeys against the installed package
         working-directory: ${{ runner.temp }}
         run: python "${{ github.workspace }}/scripts/journeys/run.py"

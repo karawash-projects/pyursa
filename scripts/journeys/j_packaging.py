@@ -18,11 +18,8 @@ from _harness import Skip, check, equal
 
 
 def _script(name: str) -> Path:
-    d = Path(sys.executable).parent
-    for cand in (d / name, d / f"{name}.exe", d / "Scripts" / f"{name}.exe"):
-        if cand.exists():
-            return cand
-    raise AssertionError(f"console script {name} not installed next to {sys.executable}")
+    from _harness import console_script
+    return console_script(name)
 
 
 def run(j):
