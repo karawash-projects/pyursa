@@ -74,7 +74,7 @@ from .types import (
     Struct,
 )
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 __all__ = [
     "Frame", "col", "lit", "len", "when", "coalesce", "row_number", "rank", "concat",
