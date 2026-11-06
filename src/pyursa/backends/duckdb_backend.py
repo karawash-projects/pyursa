@@ -59,6 +59,19 @@ def checked_int(h: str) -> str:
             f"ELSE error('Overflow: integer result outside the Int64 range') END)")
 
 
+def checked_decimal_sum(v: str, scale: int, over: str = "") -> str:
+    """SUM of a decimal that raises instead of wrapping. DuckDB checks overflow while summing rows, but
+    combining partial sums from parallel pipelines (e.g. UNION ALL inputs) can wrap around silently.
+    A wrapped result is off by about 2^127 units, so comparing with a float sum detects it reliably;
+    the tolerance scales with the sum of absolute values to allow for float rounding."""
+    exact, approx = f"SUM({v}) {over}", f"SUM(CAST({v} AS DOUBLE)) {over}"
+    mag = f"SUM(abs(CAST({v} AS DOUBLE))) {over}"
+    biggest = f"CAST('{'9' * (38 - scale)}{'.' + '9' * scale if scale else ''}' AS DECIMAL(38,{scale}))"
+    return (f"(CASE WHEN ({exact}) IS NULL THEN NULL "
+            f"WHEN abs({exact}) <= {biggest} AND abs(CAST(({exact}) AS DOUBLE) - ({approx})) <= 1e-9 * ({mag}) + 1e-9 "
+            f"THEN ({exact}) ELSE error('Overflow: decimal result needs more than 38 digits') END)")
+
+
 def q(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
@@ -92,6 +105,26 @@ def _lit(value) -> str:
     raise TypeError(f"Unsupported literal {value!r}")
 
 
+def _has_float(t: DType) -> bool:
+    if t.kind == "Float64":
+        return True
+    if t.kind == "List":
+        return _has_float(t.inner)
+    if t.kind == "Struct":
+        return any(_has_float(ft) for _, ft in t.fields or ())
+    return False
+
+
+def _arrow_has_float(t: pa.DataType) -> bool:
+    if pa.types.is_floating(t):
+        return True
+    if pa.types.is_list(t) or pa.types.is_large_list(t):
+        return _arrow_has_float(t.value_type)
+    if pa.types.is_struct(t):
+        return any(_arrow_has_float(t.field(i).type) for i in range(t.num_fields))
+    return False
+
+
 class _Compiler:
     """params=None renders literals inline (for explain output); a dict binds every
     user-supplied value as a named parameter, so no data is ever spliced into SQL text."""
@@ -100,6 +133,7 @@ class _Compiler:
         self.tables: dict[str, pa.Table] = {}
         self.n = 0
         self.params = params
+        self.float_files = False
 
     def lit(self, value) -> str:
         if isinstance(value, _dt.datetime) and value.tzinfo is not None:
@@ -136,6 +170,11 @@ class _Compiler:
         if isinstance(node, P.Source):
             cols = self.cols(node.schema)
             if node.paths:
+                # conform file types (int32, float32, ms timestamps, ...) to the declared schema
+                cols = ", ".join(f"CAST({q(n)} AS {sql_type(t)}) AS {q(n)}" if node.needs_cast(n) else q(n)
+                                 for n, t in node.schema.items())
+                if any(_has_float(t) for t in node.schema.values()):
+                    self.float_files = True
                 if any(ch in p for p in node.paths for ch in "[]*?{}"):
                     # read_parquet always expands globs; a PyArrow dataset reads exactly these files
                     import pyarrow.dataset as pads
@@ -249,6 +288,8 @@ class _Compiler:
         if isinstance(e, E.Alias):
             return x(e.operand)
         if isinstance(e, E.BinOp):
+            if e.op in E.COMPARE and (exact := E.exact_decimal_compare(e, schema)) is not e:
+                return x(exact)
             l, r = x(e.left), x(e.right)
             if e.op == "/":
                 return f"(CAST({l} AS DOUBLE) / CAST({r} AS DOUBLE))"
@@ -412,6 +453,8 @@ class _Compiler:
             return {"mean": f"AVG({f})", "median": f"median({f})", "std": f"stddev_samp({f})", "var": f"var_samp({f})"}[fn]
         if fn == "sum" and e.operand.dtype(schema) == DType.INT64:
             return checked_int(f"SUM(CAST({v} AS HUGEINT))")
+        if fn == "sum" and e.operand.dtype(schema).is_decimal:
+            return checked_decimal_sum(v, e.operand.dtype(schema).scale)
         if fn == "max" and e.operand.dtype(schema).is_float:
             # NaN is the largest value; also stops DuckDB answering from Parquet statistics, which skip NaN
             return f"(CASE WHEN bool_or(isnan({v})) THEN CAST('nan' AS DOUBLE) ELSE MAX({v}) END)"
@@ -426,6 +469,8 @@ class _Compiler:
             if inner.fn == "sum" and inner.operand is not None and inner.operand.dtype(schema) == DType.INT64:
                 v = self.expr(inner.operand, schema)
                 return checked_int(f"SUM(CAST({v} AS HUGEINT)) {over}")
+            if inner.fn == "sum" and inner.operand is not None and inner.operand.dtype(schema).is_decimal:
+                return checked_decimal_sum(self.expr(inner.operand, schema), inner.operand.dtype(schema).scale, over)
             if inner.fn == "max" and inner.operand is not None and inner.operand.dtype(schema).is_float:
                 v = self.expr(inner.operand, schema)
                 return f"(CASE WHEN bool_or(isnan({v})) {over} THEN CAST('nan' AS DOUBLE) ELSE MAX({v}) {over} END)"
@@ -443,6 +488,8 @@ class _Compiler:
             frame = f"OVER ({part}ORDER BY {stable} ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)"
             if inner.operand.dtype(schema) == DType.INT64:
                 return checked_int(f"SUM(CAST({v} AS HUGEINT)) {frame}")
+            if inner.operand.dtype(schema).is_decimal:
+                return checked_decimal_sum(v, inner.operand.dtype(schema).scale, frame)
             return f"SUM({v}) {frame}"
         if fn == "shift":
             n = inner.param
@@ -471,10 +518,11 @@ class DuckDBBackend(Backend):
         try:
             con.execute("SET preserve_insertion_order = true")
             con.execute("SET TimeZone = 'UTC'")
-            if any(pa.types.is_floating(f.type) for t in c.tables.values() for f in t.schema):
-                # DuckDB's filter pushdown into Arrow scans compares NaN by IEEE rules, which contradicts
-                # the NaN-is-largest rule it uses everywhere else; keep filters in DuckDB itself.
-                con.execute("SET disabled_optimizers = 'filter_pushdown'")
+            if c.float_files or any(_arrow_has_float(f.type) for t in c.tables.values() for f in t.schema):
+                # NaN is the largest float in pyursa (and in DuckDB's own comparisons), but two optimizers
+                # disagree: filter pushdown into Arrow scans compares by IEEE rules, and statistics
+                # propagation trusts Parquet min/max stats, which ignore NaN, and prunes NaN rows.
+                con.execute("SET disabled_optimizers = 'filter_pushdown,statistics_propagation'")
             for name, table in c.tables.items():
                 con.register(name, table)
             for method in ("to_arrow_table", "fetch_arrow_table"):  # duckdb >= 1.5 / older 1.x

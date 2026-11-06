@@ -59,8 +59,8 @@ Python 3.10+. From a source checkout: `pip install -e ".[dev]"`.
   Groq, Together, Fireworks, Azure, Vertex, Databricks, Snowflake, Cloudflare, OpenRouter, LiteLLM,
   Ollama, vLLM, ...) plus native Claude and Amazon Bedrock (Nova, Claude on AWS). Dedup, batching,
   caching, row/token budgets, cost reports and PII redaction included. See [providers](docs/providers.md).
-- **MCP server.** Handles instead of data, sandboxed files, a code-free expression parser,
-  per-client session isolation.
+- **MCP server.** Handles instead of data, a required sandbox root, read-only by default, hidden files
+  blocked, a code-free expression parser, per-client session isolation.
 - **Fast.** About 3–4× pandas on a typical analysis at 2M rows (see `scripts/e2e.py`).
 
 ## Documentation

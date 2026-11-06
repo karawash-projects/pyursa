@@ -190,6 +190,16 @@ def _mismatch(e, msg, lt, rt, desc, fix=None) -> TypeMismatchError:
                              suggestions=[s])
 
 
+def col_src_name(name: str) -> str:
+    """A column name as a Python string literal, safe to paste even with quotes or backslashes in it."""
+    import json as _json
+    return _json.dumps(name, ensure_ascii=False)
+
+
+def col_src(name: str) -> str:
+    return f"col({col_src_name(name)})"
+
+
 class Col(Expr):
     def __init__(self, name: str):
         if not isinstance(name, str):
@@ -204,7 +214,7 @@ class Col(Expr):
     def output_name(self): return self.name
     def columns(self): return {self.name}
     def cols_outside_agg(self): return {self.name}
-    def __repr__(self): return f'col("{self.name}")'
+    def __repr__(self): return f"col({col_src_name(self.name)})"
 
 
 class Lit(Expr):
@@ -236,6 +246,65 @@ def _lit_repr(v: Any) -> str:
     if isinstance(v, _dt.date) and not isinstance(v, _dt.datetime):
         return f"date({v.year}, {v.month}, {v.day})"
     return repr(v)
+
+
+_FLIP = {"<": ">", "<=": ">=", ">": "<", ">=": "<=", "==": "==", "!=": "!="}
+
+
+def exact_decimal_compare(e: "BinOp", schema) -> "BinOp":
+    """Rewrite `column <op> decimal literal` when the literal has more decimal places than the column.
+
+    Comparing Decimal(38,0) with 1.00001 would otherwise widen both sides to Decimal(38,5), which can't
+    hold the column's values. Because the column's values are multiples of 10^-s, the comparison is
+    exactly equivalent to one against the literal rounded to s places (down for > and <=, up for >= and <),
+    and == / != against a literal that can't be represented is always false / true (null for null)."""
+    import decimal as _d
+    if e.op not in COMPARE:
+        return e
+    left, right, op = e.left, e.right, e.op
+    if isinstance(left, Lit) and not isinstance(right, Lit):
+        left, right, op = right, left, _FLIP[op]
+    if not isinstance(right, Lit) or not isinstance(right.value, _d.Decimal) or not right.value.is_finite():
+        return e
+    ct = left.dtype(schema)
+    if not (ct.is_decimal or ct == DType.INT64):
+        return e
+    s = ct.scale if ct.is_decimal else 0
+    v = right.value
+    exp = v.as_tuple().exponent
+    if not isinstance(exp, int) or -exp <= s:
+        return e
+    q = _d.Decimal(1).scaleb(-s)
+    ctx = _d.Context(prec=60)
+    down, up = v.quantize(q, rounding=_d.ROUND_FLOOR, context=ctx), v.quantize(q, rounding=_d.ROUND_CEILING, context=ctx)
+    if op in ("==", "!="):
+        if down == v:
+            new = down
+        else:  # never equal: x != x is false for every non-null decimal, and null for null
+            return BinOp("!=" if op == "==" else "==", left, left)
+    else:
+        new = down if op in (">", "<=") else up
+    if ct == DType.INT64 and -(2**63) <= new <= 2**63 - 1:
+        new = int(new)
+    if len(new.as_tuple().digits) > 38 if isinstance(new, _d.Decimal) else False:
+        return e
+    return BinOp(op, left, Lit(new))
+
+
+_ASCII_CLASS = {"d": "[0-9]", "w": "[A-Za-z0-9_]", "s": "[ \\t\\n\\r\\f\\v]", "b": "(^|[^A-Za-z0-9_])"}
+
+
+def _unicode_class(pattern: str) -> str | None:
+    """The first unescaped \\d \\w \\s \\b (or uppercase) in a pattern, if any."""
+    i = 0
+    while i < len(pattern) - 1:
+        if pattern[i] == "\\":
+            if pattern[i + 1] in "dDwWsSbB":
+                return pattern[i + 1]
+            i += 2
+            continue
+        i += 1
+    return None
 
 
 class BinOp(Expr):
@@ -550,6 +619,14 @@ class StrOp(Expr):
                     f"Regex {self.arg!r} uses lookaround or backreferences, which not every engine supports.",
                     suggestions=[{"description": "Rewrite without (?=...), (?!...), (?<=...), (?<!...) or \\1; "
                                                  "combine several contains_regex() conditions with & and ~ instead."}],
+                )
+            cls = _unicode_class(self.arg)
+            if cls is not None:
+                raise InvalidOperationError(
+                    f"Regex {self.arg!r} uses \\{cls}, which matches different characters on different engines "
+                    f"(Polars treats it as Unicode, so Arabic or Devanagari digits count as \\d; DuckDB doesn't).",
+                    suggestions=[{"description": f"Use an explicit class instead of \\{cls}.",
+                                  "fix": repr(_ASCII_CLASS[cls.lower()])}],
                 )
         if self.op in ("contains", "contains_regex", "starts_with", "ends_with"):
             return DType.BOOLEAN

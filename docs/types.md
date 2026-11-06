@@ -19,7 +19,7 @@ Use constants (`pu.Int64`), constructors (`pu.Decimal(12, 2)`, `pu.Datetime("UTC
 
 ## Nothing is converted silently
 
-These raise an error (`UnsupportedTypeError`, `DuplicateColumnError`, `INTEGER_OVERFLOW` or `CAST_FAILED`) instead of corrupting data:
+These raise an error (`UnsupportedTypeError`, `DuplicateColumnError`, `INTEGER_OVERFLOW`, `DECIMAL_OVERFLOW` or `CAST_FAILED`) instead of corrupting data:
 
 - Timestamps with sub-microsecond values (nanoseconds would be truncated).
 - Unsigned 64-bit values above the Int64 range.
@@ -27,6 +27,8 @@ These raise an error (`UnsupportedTypeError`, `DuplicateColumnError`, `INTEGER_O
 - Binary, time-of-day, duration, map and union columns (cast them yourself first).
 - Column names that differ only by letter case (`A` and `a`), contain NUL, or start with `__pu_`.
 - Int64 results that overflow (sums, arithmetic, running totals) raise `INTEGER_OVERFLOW` instead of wrapping.
+- Decimal results that need more than 38 digits (products, sums, running totals) raise `DECIMAL_OVERFLOW` instead of wrapping.
+- Parquet columns stored as category, int8–int32, float32 or second/millisecond timestamps are read as String, Int64, Float64 and microsecond Datetime on every engine.
 
 ## NaN
 

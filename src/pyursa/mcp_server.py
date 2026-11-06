@@ -5,7 +5,8 @@ Run:
     pyursa-mcp --root ./data --transport streamable-http   # many clients, isolated sessions
     python -m pyursa.mcp_server --root ./data --backend duckdb
 
-Each connected client gets its own session: its own frame handles, LLM cache and
+--root is required and the server is read-only unless --allow-write is given; hidden files are
+never accessible. Each connected client gets its own session: its own frame handles, LLM cache and
 usage reports. Nothing is shared between clients except the server-wide settings
 below (allowed roots, backend, model, limits) and an explicit --llm-cache file.
 
@@ -17,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import threading
+import weakref
 from collections import OrderedDict
 from typing import Any
 
@@ -47,7 +49,8 @@ except ImportError:  # pragma: no cover - mcp 1.x or not installed
 
 
 class SessionRegistry:
-    """One ToolSession per MCP client session, least-recently-used eviction."""
+    """One ToolSession per MCP client connection. A session is freed as soon as its connection object
+    is garbage-collected (the client disconnected); least-recently-used eviction caps the total."""
 
     def __init__(self, factory, max_sessions: int = MAX_SESSIONS) -> None:
         self._factory, self._max = factory, max_sessions
@@ -58,21 +61,40 @@ class SessionRegistry:
         key = id(client_session)
         with self._lock:
             entry = self._sessions.get(key)
-            if entry is not None and entry[0] is client_session:
+            if entry is not None and _deref(entry[0]) is client_session:
                 self._sessions.move_to_end(key)
                 return entry[1]
             ts = self._factory()
-            self._sessions[key] = (client_session, ts)  # keep a reference so the id can't be reused
+            try:  # a weak reference lets the session go away with the connection
+                ref: Any = weakref.ref(client_session, lambda _r, k=key: self._drop(k, _r))
+            except TypeError:  # not weak-referenceable: keep it alive so its id can't be reused
+                ref = client_session
+            self._sessions[key] = (ref, ts)
             while len(self._sessions) > self._max:
                 self._sessions.popitem(last=False)
             return ts
+
+    def _drop(self, key: int, ref: Any) -> None:
+        with self._lock:
+            entry = self._sessions.get(key)
+            if entry is not None and entry[0] is ref:
+                del self._sessions[key]
 
     def __len__(self) -> int:
         return len(self._sessions)
 
 
+def _deref(ref: Any) -> Any:
+    return ref() if isinstance(ref, weakref.ref) else ref
+
+
+class NoSessionError(RuntimeError):
+    """Raised when a tool call has no client connection to attach a session to (fails closed)."""
+
+
 def build_server(roots: list[str] | None = None, backend: str | None = None, *, llm: Any = None,
-                 redact_pii: bool = False, max_sessions: int = MAX_SESSIONS):
+                 redact_pii: bool = False, max_sessions: int = MAX_SESSIONS, allow_write: bool = False,
+                 max_load_bytes: int | None = 2 * 1024**3):
     """llm: an LLMConfig template; each client session gets a copy with its own in-memory cache
     (unless the template uses a persistent cache file, which is then shared deliberately)."""
     from .semantic import LLMCache
@@ -82,18 +104,22 @@ def build_server(roots: list[str] | None = None, backend: str | None = None, *, 
         if llm is not None:
             cache = llm.cache if getattr(llm.cache, "_db", None) is not None else LLMCache()
             cfg = llm.copy(cache=cache)
-        return ToolSession(roots=roots, backend=backend, llm=cfg, redact_pii=redact_pii)
+        return ToolSession(roots=roots, backend=backend, llm=cfg, redact_pii=redact_pii,
+                           allow_write=allow_write, max_load_bytes=max_load_bytes)
 
     if _Server is None:
         raise ImportError('The MCP server needs the mcp package: pip install "mcp>=1.2"')
+    if not roots:
+        raise ValueError("build_server needs roots: the folders the agent may use (e.g. ['./data']).")
     registry = SessionRegistry(factory, max_sessions)
     server = _Server(name="pyursa", instructions=INSTRUCTIONS)
 
     def sess(ctx) -> ToolSession:
         try:
             client = ctx.session
-        except Exception:  # no request context (e.g. a direct call in tests): one shared fallback
-            return registry.get(registry)
+        except Exception:  # no client connection: refuse rather than share one session between callers
+            raise NoSessionError("This tool call has no client session, so pyursa can't isolate its data. "
+                                 "Call tools through an MCP client connection.") from None
         # mcp 2.x builds a ServerSession per request but keeps one Connection per client;
         # mcp 1.x keeps one ServerSession per client.
         connection = getattr(ctx, "connection", None) if not callable(getattr(ctx, "connection", None)) else None
@@ -172,7 +198,12 @@ def build_server(roots: list[str] | None = None, backend: str | None = None, *, 
 
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="pyursa MCP server")
-    ap.add_argument("--root", action="append", help="Directory the agent may read/write (repeatable). Default: cwd.")
+    ap.add_argument("--root", action="append", required=True,
+                    help="Folder the agent may read (repeatable; required). Hidden files are never accessible.")
+    ap.add_argument("--allow-write", action="store_true",
+                    help="Let the agent export files into the roots (off by default: read-only)")
+    ap.add_argument("--max-load-mb", type=float, default=2048,
+                    help="Largest CSV/JSON file to load; they are read into memory (default 2048)")
     ap.add_argument("--backend", default=None, help="polars (default) or duckdb")
     ap.add_argument("--llm", default=None, help="Model for llm_* steps as provider:model, e.g. anthropic:claude-haiku-5-5, "
                                                 "claude:claude-haiku-5-5 (OpenAI-compatible), bedrock:us.amazon.nova-2-lite-v1:0, "
@@ -202,7 +233,8 @@ def main(argv: list[str] | None = None) -> None:
             price_per_mtok=price,  # type: ignore[arg-type]
             redact_pii=args.redact_pii,
         )
-    server = build_server(args.root, args.backend, llm=llm, redact_pii=args.redact_pii)
+    server = build_server(args.root, args.backend, llm=llm, redact_pii=args.redact_pii,
+                          allow_write=args.allow_write, max_load_bytes=int(args.max_load_mb * 1024**2))
     if args.transport == "stdio":
         server.run(transport="stdio")
     else:

@@ -17,7 +17,7 @@ def session(tmp_path):
         "qty": [10, 20, None, 5, 20],
     }), tmp_path / "orders.parquet")
     (tmp_path / "managers.csv").write_text("region,manager\neast,Ana\nwest,Bo\n")
-    return ToolSession(roots=[tmp_path])
+    return ToolSession(roots=[tmp_path], allow_write=True)
 
 
 def test_agent_workflow(session, tmp_path):

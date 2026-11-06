@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
 
@@ -109,6 +110,16 @@ class Frame:
         """Keep rows where every condition is true (null counts as false). Conditions are combined with &."""
         if not predicates:
             raise InvalidOperationError("filter() needs at least one condition.")
+        for p in predicates:
+            if isinstance(p, str):
+                raise InvalidOperationError(
+                    f"filter() takes expressions, not strings: {p!r}.", code="BAD_ARGUMENTS",
+                    suggestions=[{"description": "Build the condition with col().", "fix": 'frame.filter(col("x") == 1)'},
+                                 {"description": "Or parse text safely.", "fix": f"frame.filter(pyursa.parse.parse_expr({p!r}))"}])
+            if not isinstance(p, Expr):
+                raise InvalidOperationError(
+                    f"filter() conditions must be expressions, got {type(p).__name__}: {p!r}.", code="BAD_ARGUMENTS",
+                    suggestions=[{"description": "Build the condition with col().", "fix": 'frame.filter(col("x") > 0)'}])
         pred = predicates[0]
         for p in predicates[1:]:
             pred = pred & p
@@ -200,12 +211,11 @@ class Frame:
         return table.num_rows
 
     def write_json(self, path: str, backend: str | None = None, overwrite: bool = False) -> int:
-        """Execute and write newline-delimited JSON (one object per row)."""
-        import json as _json
+        """Execute and write newline-delimited JSON (one object per row). The output is strict JSON:
+        decimals and dates are written as exact strings, and NaN/Infinity (which JSON can't represent)
+        as null. Use Parquet to keep non-finite floats."""
         table = self._for_write(path, overwrite, backend)
-        with open(path, "w", encoding="utf-8") as fh:
-            for row in table.to_pylist():
-                fh.write(_json.dumps(row, default=_json_default, ensure_ascii=False) + "\n")
+        write_json_table(table, path)
         return table.num_rows
 
     def _for_write(self, path: str, overwrite: bool, backend: str | None) -> pa.Table:
@@ -350,9 +360,9 @@ class Frame:
         return profile(self, backend=backend, **kwargs)
 
     def describe_for_llm(self, tokens: int = 800, backend: str | None = None, **kwargs: Any) -> str:
+        """Markdown summary that fits within `tokens`, for putting a dataset in an LLM's context. Pass redact=True to mask PII."""
         if not isinstance(tokens, int) or isinstance(tokens, bool) or tokens < 20:
             raise InvalidOperationError("describe_for_llm() needs tokens >= 20.")
-        """Markdown summary that fits within `tokens`, for putting a dataset in an LLM's context. Pass redact=True to mask PII."""
         from .summarize import describe_for_llm
         return describe_for_llm(self, tokens=tokens, backend=backend, **kwargs)
 
@@ -404,9 +414,21 @@ def from_polars(df, name: str = "data") -> Frame:
     return from_arrow(df.to_arrow(), name)
 
 
-def read_parquet(path: str | Sequence[str], name: str | None = None) -> Frame:
+def read_parquet(path: "str | os.PathLike | Sequence[str | os.PathLike]", name: str | None = None) -> Frame:
     """Lazily scan Parquet: a file, a list of files, a glob ("data/*.parquet") or a directory."""
     import os
+    if isinstance(path, os.PathLike):
+        path = os.fspath(path)
+    if not isinstance(path, str):
+        if isinstance(path, (bytes, dict)) or not hasattr(path, "__iter__"):
+            raise InvalidOperationError(f"read_parquet() takes a path or a list of paths, got {type(path).__name__}.",
+                                        code="BAD_ARGUMENTS")
+        path = [os.fspath(p) if isinstance(p, os.PathLike) else p for p in path]
+        if not path:
+            raise InvalidOperationError("read_parquet() got an empty list of files.", code="FILE_NOT_FOUND",
+                                        suggestions=[{"description": "Pass at least one file, a folder or a glob."}])
+        if not all(isinstance(p, str) for p in path):
+            raise InvalidOperationError("read_parquet() paths must be strings or path objects.", code="BAD_ARGUMENTS")
     first = (path if isinstance(path, str) else str(list(path)[0])).rstrip("/\\")
     stem = os.path.splitext(os.path.basename(first))[0]
     if any(ch in stem for ch in "*?[") or not stem:  # a glob: name it after its folder
@@ -416,7 +438,7 @@ def read_parquet(path: str | Sequence[str], name: str | None = None) -> Frame:
                           name=name or default))
 
 
-def read_json(path: str, name: str | None = None) -> Frame:
+def read_json(path: "str | os.PathLike", name: str | None = None) -> Frame:
     """Read newline-delimited JSON (one object per line) with engine-independent type inference."""
     import os
 
@@ -430,6 +452,24 @@ def concat(frames: Sequence[Frame], intent: str | None = None) -> Frame:
     if len(frames) < 2:
         raise InvalidOperationError("concat() needs at least two frames.")
     return frames[0].concat(*frames[1:], intent=intent)
+
+
+def _finite(v: Any) -> Any:
+    if isinstance(v, float) and (v != v or v in (float("inf"), float("-inf"))):
+        return None
+    if isinstance(v, list):
+        return [_finite(x) for x in v]
+    if isinstance(v, dict):
+        return {k: _finite(x) for k, x in v.items()}
+    return v
+
+
+def write_json_table(table: pa.Table, path: str) -> None:
+    """Strict newline-delimited JSON, shared by Frame.write_json and the MCP export tool."""
+    import json as _json
+    with open(path, "w", encoding="utf-8") as fh:
+        for row in table.to_pylist():
+            fh.write(_json.dumps(_finite(row), default=_json_default, ensure_ascii=False, allow_nan=False) + "\n")
 
 
 def _json_default(v: Any) -> Any:
@@ -446,12 +486,15 @@ def read_csv(path: str, name: str | None = None, *, empty_as_null: bool = True,
              schema: dict[str, DType | str] | None = None, delimiter: str = ",") -> Frame:
     """Read a CSV with a single, engine-independent type inference (PyArrow).
 
-    Empty fields become null (like pandas); pass empty_as_null=False to keep them as "".
+    Only empty fields mean "missing": text such as "NA", "N/A", "null" or "nan" is kept as written (a
+    country code "NA" stays "NA"; "nan" in a numeric column is the float NaN). Empty fields become null
+    (like pandas); pass empty_as_null=False to keep empty text fields as "".
     Pass schema={"col": "Decimal(12,2)", ...} to fix column types instead of inferring them."""
     import os
 
     import pyarrow.csv as pcsv
     opts = pcsv.ConvertOptions(
+        null_values=[""],  # PyArrow's default list also turns "NA", "null", "nan", "#N/A", ... into null
         strings_can_be_null=empty_as_null,
         column_types={n: DType(t).to_arrow() for n, t in (schema or {}).items()} or None,
     )

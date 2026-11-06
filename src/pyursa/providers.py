@@ -280,6 +280,21 @@ def _missing_key(provider: str, env: str, alternatives: tuple[str, ...] = ()) ->
     )
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects: urllib would forward Authorization / api-key headers to whatever host
+    a redirect names, which could leak keys to a misconfigured or hostile endpoint."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect())
+
+
+def _urlopen(req: urllib.request.Request, timeout: float):
+    return _OPENER.open(req, timeout=timeout)
+
+
 def _post_json(url: str, body: dict[str, Any], headers: dict[str, str], *, timeout: float, max_attempts: int,
                provider: str, model: str, hints, signer=None) -> dict[str, Any]:
     """POST JSON with retries on rate limits and transient errors. Errors never include keys.
@@ -292,9 +307,18 @@ def _post_json(url: str, body: dict[str, Any], headers: dict[str, str], *, timeo
             all_headers.update(signer(url, data, all_headers))
         req = urllib.request.Request(url, data=data, headers=all_headers, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with _urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode())
         except urllib.error.HTTPError as e:
+            if 300 <= e.code < 400:  # never follow: urllib would re-send the API key to the new host
+                where = e.headers.get("Location", "") if e.headers else ""
+                raise LLMProviderError(
+                    f"{provider} answered with a redirect (HTTP {e.code}){f' to {where}' if where else ''}.",
+                    details={"provider": provider, "model": model, "status": e.code, "url": url.split("?")[0],
+                             "location": where},
+                    suggestions=[{"description": "pyursa doesn't follow redirects, so your key is never sent to "
+                                                 "another address. Set base_url to the final address if you trust it."}],
+                ) from None
             detail = _error_text(e)
             if e.code not in _RETRY_STATUSES or attempt == max_attempts - 1 or _daily_quota_exhausted(e):
                 raise LLMProviderError(

@@ -3,6 +3,70 @@
 All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and versions follow [SemVer](https://semver.org/).
 
+## [1.1.0] - 2026-11-06
+
+Fixes from the 1.0.1 pre-production review, plus three more silent-corruption bugs found while
+verifying it. Several bugs returned wrong answers without an error; upgrading is strongly recommended.
+
+### Security
+- **The MCP server needs `--root`** and `ToolSession` needs `roots=`; there is no default folder any more
+  (it used to be the current directory). To keep the old behavior: `--root .`.
+- **Sessions are read-only by default.** `export` needs `--allow-write` / `ToolSession(allow_write=True)`,
+  and writes only `.parquet`, `.csv` and `.json` files.
+- **Hidden files and folders** (`.env`, `.git`, `.secrets.json`, ...) are never readable or writable.
+- **Glob patterns are expanded only inside a root.** Absolute or `..` patterns used to be expanded before
+  the sandbox check, revealing which files exist elsewhere (`/etc/pass*`) and walking the whole disk.
+- **API keys never follow redirects.** A 3xx answer from a provider is an error; urllib used to re-send
+  the `Authorization` / `api-key` header to whatever host the redirect named.
+- **Prompt data can't break out of its block:** `<`, `>` and `&` are escaped in the JSON sent to models.
+- **Column and dataset names are escaped in summaries** like cell values, and instruction-like names are
+  flagged (a CSV header could inject lines into `describe_for_llm`).
+- MCP sessions are freed when a client disconnects, tool calls within a session run one at a time, and a
+  call without a client connection is refused instead of sharing one fallback session.
+
+### Fixed (wrong results)
+- Parquet columns kept their file types on Polars: category columns failed string functions, joins and
+  concat; int32 and millisecond timestamps couldn't be combined with other data; float32 math differed
+  between engines. Both engines now read file columns as their declared type.
+- DuckDB dropped NaN rows from Parquet files (`x > 100` and `x == NaN` lost rows) because Parquet
+  min/max statistics ignore NaN. Older Polars did the same; neither uses those statistics for float files now.
+- `read_csv` turned `"NA"`, `"null"`, `"nan"` and similar text into null. Only empty fields are missing now.
+- `FunctionClient` gave two closures, bound methods or callable objects the same cache key, so one
+  function's answers were served for another. Keys now include the captured values.
+- DuckDB could wrap a decimal `sum()` around to a wrong (negative) number when combining partial sums,
+  and Polars 1.x wrapped decimal `+`, `-`, `*` and `sum()`. Results that need more than 38 digits now raise
+  the new `DECIMAL_OVERFLOW` error on every engine and version.
+- Decimal `+` and `-` kept the inputs' precision (`Decimal(37,2) + Decimal(37,2)` failed); they now
+  return `Decimal(38, s)` as documented.
+- Polars rounded decimal products to the larger operand scale; products are exact on every engine.
+- Comparing a wide decimal with a literal that has more decimal places (`Decimal(38,0) > 1.00001`) failed
+  with CAST_FAILED; it is now exact.
+- `contains_regex` with `\d`, `\w`, `\s` or `\b` matched different characters on each engine; these
+  classes are now rejected with a suggested replacement such as `[0-9]`.
+
+### Fixed (errors and robustness)
+- One failed LLM call threw away the answers of every other call in the step. Failures now cost only their
+  own rows, are reported (`failed_calls`, `errors`), and all good answers are cached.
+- Inside tool sessions, previews, counts and summaries of a frame reuse its LLM results instead of
+  calling the model again; the in-memory LLM cache is bounded (200,000 answers by default).
+- `write_json` wrote `NaN`/`Infinity`, which strict JSON parsers reject, and disagreed with MCP `export`.
+  Both write strict JSON now (non-finite floats as null).
+- Decimal overflow was reported as `INTEGER_OVERFLOW`; it is `DECIMAL_OVERFLOW` now.
+- `read_parquet(Path(...))`, `read_parquet([])` and `filter("x == 1")` crashed with Python errors; they
+  work or give structured errors now. `set_llm()` and per-step limits are validated, and `max_rows=0` /
+  `batch_size=0` are no longer silently ignored.
+- `describe_for_llm` skips the top-values query for columns where every value is unique (IDs).
+- CSV/JSON loads in tool sessions are capped (`max_load_bytes`, `--max-load-mb`), because those formats
+  are read into memory; `export` checks the file type before running the query.
+- Unknown time zones and offsets outside -12:00..+14:00 are rejected; fixed offsets are normalized in every
+  `Datetime` type. `describe_for_llm` has its docstring again; paste-ready fixes quote column names safely.
+
+### Changed
+- Development status is back to Beta until a follow-up review comes back clean.
+- The version is defined once (`pyursa.__version__`); releases check that the tag matches and run the tests.
+- New Parquet-file conformance tests read category, int8–32, uint8/32, float32, NaN, s/ms/zoned timestamps,
+  dates, decimals, booleans and lists from files on every engine and compare them with in-memory data.
+
 ## [1.0.1] - 2026-10-21
 
 ### Fixed

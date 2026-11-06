@@ -19,6 +19,10 @@ practical.
   breaking change, except bug fixes where an engine violated the contract.
 - `ToolSession` method names, arguments and the `{"ok": ...}` result shape; MCP tool names.
 
+**Security exception:** when a default is unsafe, a minor release may change it to a safer one
+(for example requiring an explicit sandbox root). The changelog lists every such change under
+"Security" with the one-line change needed to keep the old behavior.
+
 **Not covered:**
 
 - Text of error messages and `describe_for_llm` output (they may be improved for agents).

@@ -26,6 +26,7 @@ import json
 import re
 import sqlite3
 import threading
+import weakref
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -72,26 +73,116 @@ class LLMClient:
         raise NotImplementedError
 
 
+_SIMPLE = (int, float, complex, str, bytes, bool, type(None), _decimal_mod.Decimal, _dt.date, _dt.datetime, _dt.time)
+
+
+def _stable_repr(v: Any, depth: int = 0) -> str | None:
+    """A description of a value that is the same in every process, or None if there isn't one."""
+    if depth > 6:
+        return None
+    if isinstance(v, _SIMPLE):
+        return f"{type(v).__qualname__}:{v!r}"
+    if isinstance(v, (list, tuple, set, frozenset)):
+        items = [_stable_repr(x, depth + 1) for x in v]
+        if any(i is None for i in items):
+            return None
+        return f"{type(v).__qualname__}[{','.join(sorted(items) if isinstance(v, (set, frozenset)) else items)}]"
+    if isinstance(v, dict):
+        items = [(_stable_repr(k, depth + 1), _stable_repr(x, depth + 1)) for k, x in v.items()]
+        if any(a is None or b is None for a, b in items):
+            return None
+        return "dict{" + ",".join(sorted(f"{a}={b}" for a, b in items)) + "}"
+    if inspect.ismodule(v):
+        return f"module:{v.__name__}"
+    if callable(v):
+        ident = _callable_identity(v, depth + 1)
+        return None if ident is None else f"callable:{ident}"
+    r = repr(v)
+    return None if " at 0x" in r or r.startswith("<") else f"{type(v).__module__}.{type(v).__qualname__}:{r}"
+
+
+def _code_identity(code: Any) -> str:
+    consts = [(_code_identity(c) if inspect.iscode(c) else repr(c)) for c in code.co_consts]
+    return repr((code.co_code, consts, code.co_names, code.co_varnames))
+
+
+def _callable_identity(fn: Any, depth: int = 0) -> str | None:
+    if depth > 6:
+        return None
+    if inspect.ismethod(fn):  # bound method: the function plus the instance it is bound to
+        inner, owner = _callable_identity(fn.__func__, depth + 1), _stable_repr(fn.__self__, depth + 1)
+        return None if inner is None or owner is None else f"method({inner};{owner})"
+    if inspect.isfunction(fn):
+        parts = [f"{fn.__module__}.{fn.__qualname__}", _code_identity(fn.__code__)]
+        captured = [c.cell_contents for c in (fn.__closure__ or ()) if _cell_has_value(c)]
+        captured += list(fn.__defaults__ or ()) + sorted((fn.__kwdefaults__ or {}).items())
+        captured += [(n, fn.__globals__[n]) for n in fn.__code__.co_names
+                     if n in fn.__globals__ and isinstance(fn.__globals__[n], _SIMPLE + (list, tuple, dict, set))]
+        r = _stable_repr(captured, depth + 1)
+        return None if r is None else "|".join(parts + [r])
+    if inspect.isbuiltin(fn):
+        return f"builtin:{getattr(fn, '__module__', '')}.{fn.__qualname__}"
+    call = type(fn).__dict__.get("__call__") or next(
+        (k.__dict__["__call__"] for k in type(fn).__mro__ if "__call__" in k.__dict__), None)
+    if call is not None and inspect.isfunction(call):  # callable object: its class, __call__ and its state
+        inner = _callable_identity(call, depth + 1)
+        state = _stable_repr(getattr(fn, "__dict__", {}), depth + 1)
+        return None if inner is None or state is None else f"object({inner};{state})"
+    return None
+
+
+def _cell_has_value(cell: Any) -> bool:
+    try:
+        _ = cell.cell_contents
+        return True
+    except ValueError:
+        return False
+
+
+def _json_for_prompt(value: Any) -> str:
+    """JSON with <, > and & escaped (\\u003c ...), so no value can close the <data> block or open a tag.
+    The escapes are still valid JSON and decode to the original text."""
+    return (json.dumps(value, default=str, ensure_ascii=False)
+            .replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e"))
+
+
 class FunctionClient(LLMClient):
     """Wrap any Python callable (another model, a rules engine, a test stub).
     `fn(row) -> dict | scalar`; a scalar is used for single-field tasks."""
 
     def __init__(self, fn: Callable[[dict[str, Any]], Any], model_id: str | None = None) -> None:
+        """model_id names the function in cache keys. By default it is derived from the function's code
+        and the values it captures (closure cells, defaults, bound instance, simple globals), so two
+        functions that could answer differently never share cached answers. When a captured value has no
+        stable description (e.g. an object without a meaningful repr), the client gets a unique id and
+        its answers are never reused by another client; pass model_id to share a persistent cache."""
         self.fn = fn
-        if model_id is None:  # identify the function by its code so different functions never share cache entries
-            code = getattr(fn, "__code__", None)
-            digest = hashlib.sha256(repr((code.co_code, code.co_consts, code.co_names)).encode()).hexdigest()[:12] \
-                if code is not None else hashlib.sha256(repr(fn).encode()).hexdigest()[:12]
-            model_id = f"function:{getattr(fn, '__qualname__', 'fn')}:{digest}"
+        if model_id is None:
+            ident = _callable_identity(fn)
+            name = getattr(fn, "__qualname__", type(fn).__qualname__)
+            if ident is None:
+                import uuid
+                model_id = f"function:{name}:unique-{uuid.uuid4().hex[:12]}"
+            else:
+                model_id = f"function:{name}:{hashlib.sha256(ident.encode()).hexdigest()[:16]}"
         self.model_id = model_id
 
     def run(self, task, items):
-        out = []
+        """One call per item; an item whose call raises becomes a failed (null) answer, unless every
+        item fails, in which case the first error is raised so the caller sees what went wrong."""
+        out, first_error = [], None
         for item in items:
-            v = self.fn(item)
+            try:
+                v = self.fn(item)
+            except Exception as e:
+                first_error = first_error or e
+                out.append(None)
+                continue
             if not isinstance(v, dict):
                 v = {next(iter(task.fields)): v}
             out.append(v)
+        if first_error is not None and all(v is None for v in out):
+            raise first_error
         return out
 
 
@@ -127,7 +218,7 @@ class PromptClient(LLMClient):
             f"Instruction: {task.instruction}\n{spec}\n\n"
             f"Output fields and types: {{{fields}}}. Dates as YYYY-MM-DD.\n"
             f'Reply exactly as: {{"results": [{{"id": 0, {fields}}}, ...]}} with one entry per item id.\n\n'
-            f"<data>\n{json.dumps(payload, default=str, ensure_ascii=False)}\n</data>"
+            f"<data>\n{_json_for_prompt(payload)}\n</data>"
         )
 
     def run(self, task, items, usage: "Usage | None" = None):
@@ -216,8 +307,12 @@ class AnthropicClient(PromptClient):
 class LLMCache:
     """In-memory cache, optionally persisted to SQLite so reruns cost nothing."""
 
-    def __init__(self, path: str | None = None) -> None:
-        self._mem: dict[str, Any] = {}
+    def __init__(self, path: str | None = None, max_entries: int = 200_000) -> None:
+        """max_entries bounds the in-memory part (least recently used answers are dropped first);
+        the SQLite file, when given, keeps everything."""
+        from collections import OrderedDict
+        self._mem: "OrderedDict[str, Any]" = OrderedDict()
+        self.max_entries = max_entries
         self._lock = threading.Lock()
         self._db = None
         if path:
@@ -227,17 +322,24 @@ class LLMCache:
     def get(self, key: str) -> Any:
         with self._lock:
             if key in self._mem:
+                self._mem.move_to_end(key)
                 return self._mem[key]
             if self._db is not None:
                 row = self._db.execute("SELECT v FROM llm_cache WHERE k = ?", (key,)).fetchone()
                 if row:
-                    self._mem[key] = json.loads(row[0])
+                    self._remember(key, json.loads(row[0]))
                     return self._mem[key]
         return None
 
+    def _remember(self, key: str, value: Any) -> None:
+        self._mem[key] = value
+        self._mem.move_to_end(key)
+        while len(self._mem) > self.max_entries:
+            self._mem.popitem(last=False)
+
     def put(self, key: str, value: Any) -> None:
         with self._lock:
-            self._mem[key] = value
+            self._remember(key, value)
             if self._db is not None:
                 self._db.execute("INSERT OR REPLACE INTO llm_cache VALUES (?, ?)", (key, json.dumps(value, default=str)))
                 self._db.commit()
@@ -277,6 +379,18 @@ def set_llm(client: LLMClient | str | None = None, *, cache_path: str | None = N
             price_per_mtok: tuple[float, float] | None = None, redact_pii: bool | None = None) -> None:
     """Configure the default model used by llm_* operators and its limits.
     `client` is a client object or a "provider:model" string such as "gemini:gemini-3.8-flash"."""
+    _check_int("max_rows", max_rows, 0)
+    _check_int("batch_size", batch_size, 1)
+    _check_int("concurrency", concurrency, 1)
+    _check_int("max_input_tokens", max_input_tokens, 0)
+    if price_per_mtok is not None and not (
+            isinstance(price_per_mtok, (tuple, list)) and len(price_per_mtok) == 2
+            and all(isinstance(x, (int, float)) and not isinstance(x, bool) and x >= 0 for x in price_per_mtok)):
+        raise InvalidOperationError("price_per_mtok must be (input_usd, output_usd) per million tokens, both >= 0.",
+                                    code="BAD_ARGUMENTS", suggestions=[{"description": "For example", "fix": "price_per_mtok=(0.10, 0.50)"}])
+    if client is not None and not isinstance(client, (str, LLMClient)) and not hasattr(client, "run"):
+        raise InvalidOperationError(f"set_llm() needs an LLM client or a 'provider:model' string, got {type(client).__name__}.",
+                                    code="BAD_ARGUMENTS")
     if isinstance(client, str):
         from .providers import llm_client
         client = llm_client(client)
@@ -298,6 +412,11 @@ def set_llm(client: LLMClient | str | None = None, *, cache_path: str | None = N
         CONFIG.redact_pii = redact_pii
 
 
+def _check_int(name: str, value: Any, minimum: int) -> None:
+    if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < minimum):
+        raise InvalidOperationError(f"{name} must be a whole number >= {minimum}, got {value!r}.", code="BAD_ARGUMENTS")
+
+
 def llm_reports() -> list[dict[str, Any]]:
     """Usage reports from the most recent execution in this thread: rows, cache hits, calls, tokens, cost."""
     return list(getattr(_LOCAL, "reports", []))
@@ -317,6 +436,8 @@ class SemanticOp(Node):
         self.child, self.kind, self.instruction = child, kind, instruction
         self.inputs = inputs
         self.outputs = outputs
+        _check_int("max_rows", max_rows, 0)
+        _check_int("batch_size", batch_size, 1)
         self.client, self.max_rows, self.batch_size = client, max_rows, batch_size
         self.config, self.redact = config, redact
         self.op = f"llm_{kind}"
@@ -395,11 +516,49 @@ def execute(node: Node, backend) -> pa.Table:
     return backend.execute(_materialize(node, backend))
 
 
+_RESULTS: "weakref.WeakKeyDictionary[Node, tuple]" = weakref.WeakKeyDictionary()
+
+
+class reuse_llm_results:
+    """Context manager: within it, re-executing a frame reuses its LLM step results, failures included."""
+
+    def __enter__(self):
+        self._prev = getattr(_LOCAL, "reuse_failed", False)
+        _LOCAL.reuse_failed = True
+        return self
+
+    def __exit__(self, *exc):
+        _LOCAL.reuse_failed = self._prev
+        return False
+
+
 def _materialize(node: Node, backend) -> Node:
     if getattr(node, "semantic", False):
+        cfg = node.config or CONFIG
+        client = node.client or cfg.client
+        fingerprint = (id(cfg), id(client), getattr(client, "model_id", None), id(cfg.cache))
+        done = _RESULTS.get(node)
+        if done is not None and done[0] == fingerprint and (
+                getattr(_LOCAL, "reuse_failed", False) or not done[2].get("failed_items")):
+            # this step already ran for this frame: reuse its answers instead of calling the model again.
+            # Inside tool sessions (preview, count, describe...) failed rows are reused too, so an agent's
+            # repeated looks don't re-send them; it retries by running the step again. Plain collect()
+            # retries failed rows.
+            reused = {**done[2], "reused": True, "llm_calls": 0, "llm_items": 0, "input_tokens": 0, "output_tokens": 0,
+                      "cache_hits": done[2].get("unique_rows", 0), "failed_calls": 0, "errors": []}
+            if "cost_usd" in reused:
+                reused["cost_usd"] = 0.0
+            _LOCAL.reports.append(reused)
+            return Source(table=done[1], name=f"{node.op}_result")
         child = _materialize(node.child, backend)
         table = backend.execute(child)
-        return Source(table=run_semantic(node, table), name=f"{node.op}_result")
+        result = run_semantic(node, table)
+        report = _LOCAL.reports[-1] if getattr(_LOCAL, "reports", None) else {}
+        try:
+            _RESULTS[node] = (fingerprint, result, dict(report))
+        except TypeError:  # pragma: no cover - node not weak-referenceable
+            pass
+        return Source(table=result, name=f"{node.op}_result")
     if not has_semantic(node):
         return node
     return _with_children(node, [_materialize(c, backend) for c in node.children()])
@@ -424,7 +583,7 @@ def run_semantic(node: SemanticOp, table: pa.Table) -> pa.Table:
         sent_rows = rows
     keys = [json.dumps(r, default=str, sort_keys=True, ensure_ascii=False) for r in sent_rows]
     unique = list(dict.fromkeys(keys))
-    budget = node.max_rows or cfg.max_rows
+    budget = cfg.max_rows if node.max_rows is None else node.max_rows
     if len(unique) > budget:
         raise LLMBudgetError(
             f"{node.op}() would send {len(unique):,} unique rows to the model; the budget is {budget:,}.",
@@ -449,7 +608,7 @@ def run_semantic(node: SemanticOp, table: pa.Table) -> pa.Table:
         else:
             misses.append(k)
 
-    size = node.batch_size or cfg.batch_size
+    size = cfg.batch_size if node.batch_size is None else node.batch_size
     batches = [misses[i:i + size] for i in range(0, len(misses), size)]
     if cfg.max_input_tokens is not None and batches:
         overhead = len(SYSTEM_PROMPT) + 600 + len(task.instruction)
@@ -469,9 +628,22 @@ def run_semantic(node: SemanticOp, table: pa.Table) -> pa.Table:
         items = [json.loads(k) for k in batch]
         return batch, (client.run(task, items, usage=usage) if takes_usage else client.run(task, items))
 
+    errors: list[BaseException] = []
+    failed_batches = 0
     if batches:
         with cf.ThreadPoolExecutor(max_workers=max(1, cfg.concurrency)) as pool:
-            for batch, results in pool.map(call, batches):
+            futures = [pool.submit(call, b) for b in batches]
+            for fut, batch in zip(futures, batches):
+                try:  # a failed batch costs only its own rows; every finished answer is kept and cached
+                    _, results = fut.result()
+                except (KeyboardInterrupt, SystemExit):
+                    for f in futures:
+                        f.cancel()
+                    raise
+                except Exception as e:
+                    errors.append(e)
+                    failed_batches += 1
+                    results = []
                 for k, res in zip(batch, list(results) + [None] * (len(batch) - len(results))):
                     value, ok = _coerce_answer(res, task.fields)
                     answers[k] = value
@@ -479,11 +651,23 @@ def run_semantic(node: SemanticOp, table: pa.Table) -> pa.Table:
                         cache.put(ck[k], value)  # only cache valid answers
                     else:
                         failures += 1
+        if errors and failed_batches == len(batches) and len(misses) == len(unique):  # no answer at all: raise
+            first = errors[0]
+            if isinstance(first, PyursaError):
+                raise first
+            from .providers import LLMProviderError
+            raise LLMProviderError(
+                f"{node.op}(): every model call failed: {type(first).__name__}: {first}"[:1000],
+                details={"model": client.model_id, "llm_calls": len(batches)},
+                suggestions=[{"description": "Check the model client; finished answers from earlier runs stay cached."}],
+            ) from first
 
     report: dict[str, Any] = {
         "op": node.op, "instruction": node.instruction, "model": client.model_id,
         "rows": len(rows), "unique_rows": len(unique), "cache_hits": len(unique) - len(misses),
         "llm_items": len(misses), "llm_calls": len(batches), "failed_items": failures,
+        "failed_calls": failed_batches,
+        "errors": sorted({f"{type(e).__name__}: {e}"[:300] for e in errors})[:5],
         "input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens,
         "tokens_estimated": usage.estimated, "redacted": bool(redact),
     }

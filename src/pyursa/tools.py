@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import functools
 import os
+import threading
 from pathlib import Path
 from typing import Any, Callable
 
@@ -81,8 +82,14 @@ class HandleNotFoundError(PyursaError):
 def _tool(fn: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, Any]]:
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        from .semantic import reuse_llm_results
+        lock = getattr(args[0], "_lock", None) if args else None
         try:
-            return {"ok": True, **fn(*args, **kwargs)}
+            with reuse_llm_results():  # an agent's repeated previews don't re-send failed LLM rows
+                if lock is None:
+                    return {"ok": True, **fn(*args, **kwargs)}
+                with lock:  # MCP runs tools in worker threads; one call at a time per session
+                    return {"ok": True, **fn(*args, **kwargs)}
         except PyursaError as e:
             return {"ok": False, "error": e.to_dict()}
         except (TypeError, ValueError, KeyError, AttributeError, OverflowError, IndexError) as e:
@@ -106,13 +113,31 @@ def _need(cond: bool, message: str) -> None:
                                     suggestions=[{"description": "Call pyursa_help for argument formats."}])
 
 
+MAX_GLOB_MATCHES = 10_000
+
+
 class ToolSession:
     def __init__(self, roots: list[str | os.PathLike] | None = None, backend: str | None = None,
-                 llm: Any = None, redact_pii: bool = False, max_frames: int = 1000) -> None:
-        """llm: an LLMConfig (isolated settings for this session), an LLM client, or None to use pu.set_llm().
+                 llm: Any = None, redact_pii: bool = False, max_frames: int = 1000, *,
+                 allow_write: bool = False, max_load_bytes: int | None = 2 * 1024**3) -> None:
+        """roots: the folders the agent may use (required; there is no default, so a session never
+        silently exposes the current directory). Hidden files and folders (names starting with ".")
+        are never readable or writable.
+        allow_write: let `export` create files inside the roots (off by default: read-only).
+        max_load_bytes: largest CSV/JSON file load_file reads (they are loaded into memory); None for no limit.
+        llm: an LLMConfig (isolated settings for this session), an LLM client, or None to use pu.set_llm().
         redact_pii: mask emails/phones/cards/SSNs/IPs in describe/preview output and LLM prompts."""
         from .semantic import LLMCache, LLMConfig
-        self.roots = [Path(r).resolve() for r in (roots or [os.getcwd()])]
+        if not roots:
+            raise InvalidOperationError(
+                "ToolSession needs roots: the folders the agent may use.", code="BAD_ARGUMENTS",
+                suggestions=[{"description": "Pass the data folder explicitly.", "fix": 'ToolSession(roots=["./data"])'}])
+        if isinstance(roots, (str, os.PathLike)):
+            roots = [roots]
+        self.roots = [Path(r).resolve() for r in roots]
+        self.allow_write = allow_write
+        self.max_load_bytes = max_load_bytes
+        self._lock = threading.RLock()
         self.backend = backend or default_backend()
         self.frames: dict[str, Frame] = {}
         self.labels: dict[str, str] = {}
@@ -156,11 +181,18 @@ class ToolSession:
         if not p.is_absolute():
             p = self.roots[0] / p
         p = p.resolve()
-        if not any(p == r or r in p.parents for r in self.roots):
+        root = next((r for r in self.roots if p == r or r in p.parents), None)
+        if root is None:
             raise SandboxError(
                 f"Path '{path}' is outside the allowed directories.",
                 details={"allowed_roots": [str(r) for r in self.roots]},
                 suggestions=[{"description": "Use a path inside an allowed root."}],
+            )
+        if any(part.startswith(".") for part in p.relative_to(root).parts):
+            raise SandboxError(
+                f"Path '{path}' is a hidden file or inside a hidden folder, which agents can't access.",
+                details={"allowed_roots": [str(r) for r in self.roots]},
+                suggestions=[{"description": "Move the data out of hidden folders (names starting with '.')."}],
             )
         if must_exist and not p.exists():
             raise SandboxError(f"File '{path}' does not exist.", code="FILE_NOT_FOUND",
@@ -212,6 +244,12 @@ class ToolSession:
         label = name or (files[0].stem if len(files) == 1 else Path(path).name.replace("*", "") or "data")
         if ext == ".parquet":
             f = read_parquet([str(p) for p in files] if len(files) > 1 else str(files[0]), name=label)
+        elif ext in (".csv", ".tsv", ".json", ".jsonl", ".ndjson") and self.max_load_bytes is not None \
+                and files[0].stat().st_size > self.max_load_bytes:
+            raise SandboxError(
+                f"'{path}' is {files[0].stat().st_size / 1024**2:,.0f} MB; CSV and JSON files are loaded into memory "
+                f"and this session's limit is {self.max_load_bytes / 1024**2:,.0f} MB.", code="FILE_TOO_LARGE",
+                suggestions=[{"description": "Convert the file to Parquet, which is read lazily, or raise max_load_bytes."}])
         elif ext in (".csv", ".tsv"):
             f = read_csv(str(files[0]), name=label, delimiter="\t" if ext == ".tsv" else ",")
         elif ext in (".json", ".jsonl", ".ndjson"):
@@ -223,15 +261,34 @@ class ToolSession:
         return {**self._summary(h), "rows": f.plan.rows_bound(), "files": len(files)}
 
     def _files(self, path: str) -> list[Path]:
-        """Resolve a file, directory or glob inside the sandbox; every match is checked individually."""
+        """Resolve a file, directory or glob inside the sandbox; every match is checked individually.
+        Patterns are expanded only inside an allowed root, so they can't probe the rest of the disk."""
         import glob as _glob
         literal = Path(path) if Path(path).is_absolute() else self.roots[0] / path
         if any(ch in path for ch in "*?[") and not literal.exists():  # an existing name is never a pattern
-            pattern = path if Path(path).is_absolute() else str(self.roots[0] / path)
-            matches = sorted(_glob.glob(pattern, recursive=True))
+            parts = Path(path).parts
+            if ".." in parts:
+                raise SandboxError(f"Patterns can't contain '..': '{path}'.",
+                                   suggestions=[{"description": "Use a pattern relative to the data folder, e.g. 'sales/*.parquet'."}])
+            root, rel = self.roots[0], path
+            if Path(path).is_absolute():
+                root = next((r for r in self.roots if Path(path).parts[:len(r.parts)] == r.parts), None)
+                if root is None:
+                    raise SandboxError(
+                        f"Pattern '{path}' is outside the allowed directories.",
+                        details={"allowed_roots": [str(r) for r in self.roots]},
+                        suggestions=[{"description": "Use a pattern relative to the data folder, e.g. 'sales/*.parquet'."}])
+                rel = str(Path(*Path(path).parts[len(root.parts):]))
+            matches = []
+            for m in _glob.iglob(rel, root_dir=root, recursive=True):
+                matches.append(m)
+                if len(matches) > MAX_GLOB_MATCHES:
+                    raise SandboxError(f"Pattern '{path}' matches more than {MAX_GLOB_MATCHES:,} files.",
+                                       suggestions=[{"description": "Use a narrower pattern."}])
+            matches = [m for m in sorted(matches) if not any(part.startswith(".") for part in Path(m).parts)]
             if not matches:
                 raise SandboxError(f"No files match '{path}'.", code="FILE_NOT_FOUND")
-            return [self._path(m) for m in matches]
+            return [self._path(str(root / m)) for m in matches]
         p = self._path(path)
         if p.is_dir():
             matches = sorted(p.rglob("*.parquet"))
@@ -373,7 +430,16 @@ class ToolSession:
 
     @_tool
     def export(self, handle: str, path: str, overwrite: bool = False) -> dict[str, Any]:
+        if not self.allow_write:
+            raise SandboxError("This session is read-only: export is turned off.", code="READ_ONLY",
+                               suggestions=[{"description": "Start the server with --allow-write (or "
+                                                            "ToolSession(allow_write=True)) to enable export."}])
         p = self._path(path, must_exist=False)
+        if p.suffix.lower() not in (".parquet", ".csv", ".json", ".jsonl", ".ndjson"):
+            raise InvalidOperationError(f"Unsupported export type '{p.suffix}'.",
+                                        suggestions=[{"description": "Use .parquet, .csv or .json."}])
+        if p.exists() and not p.is_file():
+            raise SandboxError(f"'{path}' exists and isn't a file.", code="FILE_EXISTS")
         if p.exists() and not overwrite:
             raise SandboxError(f"'{path}' already exists.", code="FILE_EXISTS",
                                suggestions=[{"description": "Pass overwrite=true or choose another path."}])
@@ -390,10 +456,8 @@ class ToolSession:
             import pyarrow.csv as pcsv
             pcsv.write_csv(table, p)
         elif ext in (".json", ".jsonl", ".ndjson"):
-            import json as _json
-            with open(p, "w", encoding="utf-8") as fh:
-                for row in _jsonable_rows(table.to_pylist()):
-                    fh.write(_json.dumps(row, ensure_ascii=False) + "\n")
+            from .frame import write_json_table
+            write_json_table(table, str(p))  # strict JSON, identical to Frame.write_json
         else:
             raise InvalidOperationError(f"Unsupported export type '{ext}'.",
                                         suggestions=[{"description": "Use .parquet, .csv or .json."}])

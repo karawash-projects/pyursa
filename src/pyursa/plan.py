@@ -16,7 +16,7 @@ from .errors import (
     TypeMismatchError,
     column_not_found,
 )
-from .expr import Col, Expr, unalias
+from .expr import Col, Expr, col_src, unalias
 from .types import DType, Schema, normalize_table, schema_from_arrow, validate_names
 
 
@@ -86,6 +86,14 @@ class Source(Node):
         return self.paths[0] if len(self.paths) == 1 else (None if not self.paths else self.paths[0])
 
     def _compute_schema(self): return schema_from_arrow(self._arrow_schema)
+
+    def needs_cast(self, name: str) -> bool:
+        """True when a file column's stored type differs from its declared type (e.g. int32, float32,
+        category, ms timestamps); engines then cast it on read so results don't depend on the file."""
+        if not self.paths:
+            return False
+        f = self._arrow_schema.field(name) if name in self._arrow_schema.names else None
+        return f is not None and not f.type.equals(self.schema[name].to_arrow())
     def params(self):
         if self.paths:
             where = f"path={self.paths[0]!r}" if len(self.paths) == 1 else f"files={len(self.paths)}"
@@ -258,7 +266,7 @@ class Aggregate(Node):
             if not e.has_agg() or outside:
                 bad = sorted(outside) or [repr(e)]
                 inner = unalias(e)
-                fix = (f'col("{bad[0]}").sum()' if isinstance(inner, Col)
+                fix = (f"{col_src(bad[0])}.sum()" if isinstance(inner, Col)
                        else f"{inner!r}.sum()") if outside else "len()"
                 raise InvalidOperationError(
                     f"agg() expression {e!r} uses {bad} outside an aggregation.",
@@ -438,7 +446,7 @@ class Concat(Node):
                 if other.schema[n] != t:
                     raise TypeMismatchError(
                         f"concat() column '{n}' is {t} in frame 0 but {other.schema[n]} in frame {i}.",
-                        suggestions=[{"description": "Cast so the types match.", "fix": f'col("{n}").cast("{t}")'}],
+                        suggestions=[{"description": "Cast so the types match.", "fix": f'{col_src(n)}.cast("{t}")'}],
                     )
         return dict(first)
 

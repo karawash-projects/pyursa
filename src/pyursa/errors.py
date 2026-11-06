@@ -112,7 +112,7 @@ def column_not_found(name: str, available: Iterable[str], where: str) -> ColumnN
             candidates.append(c)
     candidates = candidates[:3]
     suggestions = [
-        {"description": f"Did you mean '{c}'?", "fix": f'col("{c}")'} for c in candidates
+        {"description": f"Did you mean '{c}'?", "fix": _col_src(c)} for c in candidates
     ]
     if not suggestions:
         suggestions.append(
@@ -123,3 +123,8 @@ def column_not_found(name: str, available: Iterable[str], where: str) -> ColumnN
         details={"column": name, "available_columns": available, "location": where},
         suggestions=suggestions,
     )
+
+
+def _col_src(name: str) -> str:
+    import json as _json
+    return f"col({_json.dumps(name, ensure_ascii=False)})"

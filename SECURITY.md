@@ -21,8 +21,9 @@ What the library defends against:
 |---|---|
 | Code execution through expressions | Expressions are parsed with a whitelisted `ast` walker (`parse.py`); `eval`/`exec` are never used. Fuzz tests (`tests/test_security.py`) check that no dangerous audit events fire. |
 | SQL injection (DuckDB backend) | Identifiers are quoted; **every user value is bound as a named parameter**, never spliced into SQL text. |
-| File access outside allowed folders | `ToolSession` / MCP server resolve every path (including each glob match and symlink target) and refuse anything outside `--root`. |
-| Prompt injection via data | Summaries and previews mark cell values as untrusted; summaries flag instruction-like text found anywhere in a column; LLM steps place row values in a JSON data block the model is told never to follow. |
+| File access outside allowed folders | `--root` is required. `ToolSession` / MCP server resolve every path (including each glob match and symlink target) and refuse anything outside it; patterns are expanded only inside a root, so they can't probe the rest of the disk. Hidden files and folders are never accessible. Sessions are read-only unless `--allow-write` is given. |
+| Prompt injection via data | Summaries and previews mark cell values as untrusted; column and dataset names are escaped like cell values; instruction-like text in values or names is flagged; LLM steps place row values in a JSON data block in which `<`, `>` and `&` are escaped, so data can't close the block. |
+| API key leaks | Provider calls never follow HTTP redirects, so a key is only ever sent to the configured address. Errors never include keys. |
 | Runaway cost | LLM steps have row budgets, optional token budgets and cost reports; previews are capped at 50 rows. |
 | Cross-client leakage (MCP over HTTP) | Each client connection gets its own session: frames, LLM cache and usage reports. |
 | Secrets in errors | Provider errors never include API keys (tested). |

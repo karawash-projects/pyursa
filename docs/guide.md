@@ -11,7 +11,7 @@ method. The original frame never changes, so `undo()` and branching are free.
 | Source | Function | Notes |
 |---|---|---|
 | Parquet file, glob, directory or list | `pu.read_parquet("data/*.parquet")` | Scanned lazily by the engine. Files must share a schema. |
-| CSV | `pu.read_csv(path, schema={"amount": "Decimal(12,2)"}, delimiter=",")` | Type inference is done once by PyArrow, so every engine sees the same types. Empty fields become null (`empty_as_null=False` to keep `""`). |
+| CSV | `pu.read_csv(path, schema={"amount": "Decimal(12,2)"}, delimiter=",")` | Type inference is done once by PyArrow, so every engine sees the same types. Only empty fields are missing: `NA`, `null` or `nan` text is kept as written (`empty_as_null=False` keeps empty text as `""`). CSV and JSON files are read into memory; Parquet is scanned lazily. |
 | Newline-delimited JSON | `pu.read_json(path)` | One object per line. |
 | In memory | `pu.from_dict`, `pu.from_arrow`, `pu.from_pandas`, `pu.from_polars` | Converted once to canonical Arrow types. |
 

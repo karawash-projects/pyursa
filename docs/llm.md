@@ -130,3 +130,17 @@ LLM steps appear in `history()`, `lineage()` and `explain()` like any other step
 Subclass `pu.PromptClient` and implement `complete(system, user) -> str` (optionally
 `complete_with_usage` to report tokens), or wrap any Python function with
 `pu.FunctionClient(fn)`.
+
+## Failures and reruns
+
+- A failed model call costs only its own rows: they come back as null and are counted in
+  `failed_items` / `failed_calls`, with the provider's message in `errors`. Every other answer is kept
+  and cached. If no answer comes back at all, the step raises the provider's error.
+- Collecting the same frame again reuses its answers and retries failed rows. Inside `ToolSession` /
+  the MCP server, previews, counts and summaries of a frame reuse its results, failed rows included,
+  so an agent looking at a frame several times doesn't pay again; running the step again retries.
+- The in-memory cache keeps the most recent 200,000 answers (`LLMCache(max_entries=...)`); a cache
+  file (`set_llm(cache_path=...)`) keeps everything.
+- `FunctionClient` caches are keyed by the function's code and the values it captures, so two
+  functions that could answer differently never share answers. Pass `model_id=` to name it yourself.
+

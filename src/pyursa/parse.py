@@ -102,7 +102,7 @@ class _Converter:
         if node.id in ("True", "False", "None"):
             return {"True": True, "False": False, "None": None}[node.id]
         raise _fail(f"Unknown name '{node.id}'. Refer to columns with col(\"{node.id}\").",
-                    self.source, node, fix=f'col("{node.id}")')
+                    self.source, node, fix=f"col({node.id!r})".replace("'", '"'))
 
     def v_UnaryOp(self, node: ast.UnaryOp) -> Any:
         v = self.visit(node.operand)

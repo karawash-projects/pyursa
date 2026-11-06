@@ -2,11 +2,11 @@
 
 _Generated from the code by `scripts/gen_api_docs.py`; do not edit by hand._
 
-Version 1.0.1.
+Version 1.1.0.
 
 ## Creating frames
 
-### `pu.read_parquet(path: str | Sequence[str], name: str | None = None) -> Frame`
+### `pu.read_parquet(path: "str | os.PathLike | Sequence[str | os.PathLike]", name: str | None = None) -> Frame`
 
 Lazily scan Parquet: a file, a list of files, a glob ("data/*.parquet") or a directory.
 
@@ -14,10 +14,12 @@ Lazily scan Parquet: a file, a list of files, a glob ("data/*.parquet") or a dir
 
 Read a CSV with a single, engine-independent type inference (PyArrow).
 
-Empty fields become null (like pandas); pass empty_as_null=False to keep them as "".
+Only empty fields mean "missing": text such as "NA", "N/A", "null" or "nan" is kept as written (a
+country code "NA" stays "NA"; "nan" in a numeric column is the float NaN). Empty fields become null
+(like pandas); pass empty_as_null=False to keep empty text fields as "".
 Pass schema={"col": "Decimal(12,2)", ...} to fix column types instead of inferring them.
 
-### `pu.read_json(path: str, name: str | None = None) -> Frame`
+### `pu.read_json(path: "str | os.PathLike", name: str | None = None) -> Frame`
 
 Read newline-delimited JSON (one object per line) with engine-independent type inference.
 
@@ -144,7 +146,9 @@ Execute and write a CSV file (nested columns are not supported in CSV).
 
 ### `Frame.write_json(self, path: str, backend: str | None = None, overwrite: bool = False) -> int`
 
-Execute and write newline-delimited JSON (one object per row).
+Execute and write newline-delimited JSON (one object per row). The output is strict JSON:
+decimals and dates are written as exact strings, and NaN/Infinity (which JSON can't represent)
+as null. Use Parquet to keep non-finite floats.
 
 ### `Frame.llm_filter(self, condition: str, *, inputs: Sequence[str] | None = None, client: Any = None, max_rows: int | None = None, batch_size: int | None = None, intent: str | None = None, redact: bool | None = None, config: Any = None) -> "Frame"`
 
@@ -207,6 +211,8 @@ Execute and return the number of rows.
 Per-column statistics as a dict (row count, nulls, distinct, min/max/mean, top values, sample rows), computed by the engine.
 
 ### `Frame.describe_for_llm(self, tokens: int = 800, backend: str | None = None, **kwargs: Any) -> str`
+
+Markdown summary that fits within `tokens`, for putting a dataset in an LLM's context. Pass redact=True to mask PII.
 
 ## GroupBy
 
@@ -428,7 +434,7 @@ Subclasses implement complete(system, user) -> str.
 
 ## Agent tools (`pyursa.tools.ToolSession`)
 
-### `ToolSession(roots: list[str | os.PathLike] | None = None, backend: str | None = None, llm: Any = None, redact_pii: bool = False, max_frames: int = 1000) -> None`
+### `ToolSession(roots: list[str | os.PathLike] | None = None, backend: str | None = None, llm: Any = None, redact_pii: bool = False, max_frames: int = 1000, *, allow_write: bool = False, max_load_bytes: int | None = 2147483648) -> None`
 
 ### `help(self) -> dict[str, Any]`
 
@@ -496,7 +502,9 @@ The rules every backend follows (`pu.SEMANTICS`):
 - **distinct**: distinct() keeps the first occurrence of each row (or subset) in input order; nulls compare equal.
 - **concat**: concat() returns all rows of the first frame, then the second, and so on.
 - **rounding**: round() rounds half away from zero (2.5 -> 3, -2.5 -> -3).
-- **decimals**: Decimal +,-,* are exact (scale: max for +/-, sum for *); / returns Float64; sum keeps the scale; mean/median/std return Float64.
+- **decimals**: Decimal +,-,* are exact with result Decimal(38, s) (s: max scale for +/-, sum of scales for *); results, sums and running totals that need more than 38 digits raise DECIMAL_OVERFLOW, never wrap; comparing a column with a literal that has more decimal places is exact; / returns Float64; sum keeps the scale; mean/median/std return Float64.
+- **files**: Parquet columns are read as their declared pyursa type (category -> String, int8-32 -> Int64, float32 -> Float64, s/ms timestamps -> microseconds) on every engine, so a file gives the same results as the same data in memory. CSV: only empty fields are missing; text such as 'NA' or 'null' is kept. JSON output is strict: NaN/inf are written as null.
+- **regex**: contains_regex uses the syntax common to RE2 and Rust regex. Lookaround, backreferences and the Unicode-dependent classes \d \w \s \b are rejected; use explicit classes such as [0-9].
 - **quantiles**: median()/quantile(q) use linear interpolation; std()/var() are sample statistics (ddof=1).
 - **windows**: Window results keep input row order; ties in order_by keep input order; rank() is SQL RANK with nulls last; cum_sum skips nulls.
 - **time_zones**: Datetime(tz) keeps its zone; .dt parts are computed in that zone; comparing different zones is an error.
@@ -506,5 +514,5 @@ The rules every backend follows (`pu.SEMANTICS`):
 - **integer_overflow**: Int64 arithmetic, sums and running totals that leave the Int64 range raise INTEGER_OVERFLOW; they never wrap around.
 - **casts**: Casts are strict and identical everywhere: text is trimmed of spaces/tabs/newlines and must then be a valid literal (integers like '+12', floats like '1e3', 'inf' or 'nan', decimals with up to 20 integer digits and 17 places, booleans 'true'/'false'/'1'/'0', dates 'YYYY-MM-DD', datetimes 'YYYY-MM-DD HH:MM[:SS[.ffffff]]' with ' ' or 'T', years 0001-9999, hours 00-23, no leap seconds); anything else raises CAST_FAILED. Float or Decimal to Int64 requires a whole number. Conversions to Decimal round half away from zero. Floats print as text that converts back to the exact same value ('NaN', 'inf'; notation such as '0.00001' vs '1e-5' can differ between engines); datetimes print as 'YYYY-MM-DD HH:MM:SS[.ffffff]'. Casts that have no single meaning (dates to numbers, floats to Boolean, changing a time zone) are rejected when the plan is built.
 - **names**: Column names must differ by more than letter case, must not contain NUL, and must not start with the reserved prefix '__pu_'.
-- **float_precision**: Float sums and means can differ in the last digits (about 1e-15 relative) between engines because they add in different orders; every other result is identical.
+- **float_precision**: Float sums and means can differ in the last digits (about 1e-15 relative) between engines because they add in different orders. Float-to-text notation can differ ('0.00001' vs '1e-5') but always converts back to the same value. Every other result is identical.
 - **known_differences**: Rare cases engines still differ on, by design of the engines: upper()/lower() of a few special characters (e.g. 'ß', 'İ'), and DuckDB may return -0.0 as 0.0 after sorting.

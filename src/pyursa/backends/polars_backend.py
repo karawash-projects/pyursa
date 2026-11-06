@@ -45,6 +45,66 @@ def _pl_dtype(t: DType):
     return pl.Null
 
 
+_MUL_SCALE_IS_SUM: bool | None = None
+
+
+def _mul_scale_is_sum() -> bool:
+    """Polars < 2 multiplies decimals at scale a+b (exact); Polars 2 at max(a, b), rounding."""
+    global _MUL_SCALE_IS_SUM
+    if _MUL_SCALE_IS_SUM is None:
+        import decimal as _d
+        v = pl.Series([_d.Decimal("1.15")], dtype=pl.Decimal(38, 2))
+        _MUL_SCALE_IS_SUM = (v * v).dtype.scale == 4
+    return _MUL_SCALE_IS_SUM
+
+
+OVERFLOW_MARKER = 7777777777  # a value that can't become Int8; Polars prints it in the error message
+
+
+def _overflow_guard(bad):
+    """An expression that raises DECIMAL_OVERFLOW when any row of `bad` is true: the marker value can't
+    become Int8, so the strict cast fails exactly when an overflow was found, and the error message
+    (which lists the failing values) identifies it."""
+    return (bad.fill_null(False).cast(pl.Int64) * OVERFLOW_MARKER).cast(pl.Int8, strict=True)
+
+
+def _max_decimal(scale: int):
+    import decimal as _d
+    text = "9" * (38 - scale) + ("." + "9" * scale if scale else "")  # exact: scaleb would round to 28 digits
+    return pl.lit(_d.Decimal(text), dtype=pl.Decimal(38, scale))
+
+
+def _checked_decimal(result, approx, mag, scale: int):
+    """Raise DECIMAL_OVERFLOW instead of returning a wrapped or over-long decimal. Older Polars wraps
+    decimal + and sum() silently; a wrapped value is off by about 2^127 units, far beyond float rounding."""
+    off = (result.cast(pl.Float64) - approx).abs() > mag * 1e-9 + 1e-300
+    too_long = (result > _max_decimal(scale)) | (result < -_max_decimal(scale))
+    guard = _overflow_guard(result.is_not_null() & (off | too_long))
+    return pl.when(guard == 0).then(result).otherwise(result)
+
+
+def _exact_decimal_product(l, lt: DType, r, rt: DType, scale: int):
+    """Exact decimal product at scale a+b on every Polars version, raising DECIMAL_OVERFLOW when it needs
+    more than 38 digits. Polars 2 rounds to the larger operand scale, so one operand is first raised to
+    the result scale (whichever can take the digits, per row). Polars 1.x keeps scale a+b but wraps on
+    overflow, so every product is also checked against the float product."""
+    own = lambda v, t: v.cast(pl.Decimal(38, t.scale if t.is_decimal else 0))  # noqa: E731
+    l, r = own(l, lt), own(r, rt)
+    wide = pl.Decimal(38, scale)
+    if _mul_scale_is_sum():
+        prod = (l * r).cast(wide, strict=False)
+    else:
+        p1 = l.cast(wide, strict=False) * r
+        p2 = l * r.cast(wide, strict=False)
+        prod = pl.coalesce(p1.cast(wide, strict=False), p2.cast(wide, strict=False))
+    approx = l.cast(pl.Float64) * r.cast(pl.Float64)
+    wrapped = (prod.cast(pl.Float64) - approx).abs() > approx.abs() * 1e-9 + 1e-300
+    too_long = (prod > _max_decimal(scale)) | (prod < -_max_decimal(scale))
+    bad = l.is_not_null() & r.is_not_null() & (prod.is_null() | wrapped | too_long)
+    guard = _overflow_guard(bad)
+    return pl.when(guard == 0).then(prod).otherwise(prod)
+
+
 class PolarsBackend(Backend):
     name = "polars"
 
@@ -62,7 +122,15 @@ class PolarsBackend(Backend):
     def _lazy(self, node: P.Node):
         if isinstance(node, P.Source):
             if node.paths:  # paths are already expanded and sandbox-checked: read them literally
-                return pl.scan_parquet(node.paths if len(node.paths) > 1 else node.paths[0], glob=False)
+                # min/max statistics ignore NaN; older Polars prunes NaN rows with them, so don't use them
+                # for files with float columns
+                stats = not any(t.kind == "Float64" or (t.kind in ("List", "Struct")) for t in node.schema.values())
+                lf = pl.scan_parquet(node.paths if len(node.paths) > 1 else node.paths[0], glob=False,
+                                     use_statistics=stats)
+                # Files keep their own types (category, int32, float32, ms timestamps); conform them to the
+                # declared schema so every later step sees the same types as on DuckDB and in memory.
+                fixes = {n: _pl_dtype(t) for n, t in node.schema.items() if node.needs_cast(n)}
+                return lf.cast(fixes, strict=True) if fixes else lf
             return pl.from_arrow(node.table).lazy()
         if isinstance(node, P.Filter):
             return self._lazy(node.child).filter(self._expr(node.predicate, node.child.schema))
@@ -136,6 +204,8 @@ class PolarsBackend(Backend):
         if isinstance(e, E.Alias):
             return x(e.operand).alias(e.name)
         if isinstance(e, E.BinOp):
+            if e.op in E.COMPARE and (exact := E.exact_decimal_compare(e, schema)) is not e:
+                return x(exact)
             l, r = x(e.left), x(e.right)
             lt, rt = e.left.dtype(schema), e.right.dtype(schema)
             if e.op == "/":
@@ -146,10 +216,17 @@ class PolarsBackend(Backend):
                     l, r = l.cast(pl.Int128), r.cast(pl.Int128)
                     res = {"+": lambda: l + r, "-": lambda: l - r, "*": lambda: l * r}[e.op]()
                     return res.cast(pl.Int64, strict=True)
+                if e.op == "*" and out_t.is_decimal and DType.NULL not in (lt, rt):
+                    return _exact_decimal_product(l, lt, r, rt, out_t.scale)
                 if out_t.is_decimal or (lt != rt and out_t != DType.NULL):
                     pt = _pl_dtype(out_t)  # exact decimal math: compute at the result scale
                     l, r = l.cast(pt), r.cast(pt)
-                return {"+": lambda: l + r, "-": lambda: l - r, "*": lambda: l * r}[e.op]()
+                res = {"+": lambda: l + r, "-": lambda: l - r, "*": lambda: l * r}[e.op]()
+                if out_t.is_decimal and e.op in ("+", "-"):
+                    lf, rf = l.cast(pl.Float64), r.cast(pl.Float64)
+                    approx = lf + rf if e.op == "+" else lf - rf
+                    return _checked_decimal(res, approx, lf.abs() + rf.abs(), out_t.scale)
+                return res
             if e.op in E.COMPARE and lt != rt and lt != DType.NULL and rt != DType.NULL:
                 ct = common_type(lt, rt)
                 if ct is not None:
@@ -302,6 +379,9 @@ class PolarsBackend(Backend):
             return pl.lit(None).first()
         if fn == "sum":  # contract: sum of only nulls is null; integer overflow is an error
             total = v.cast(pl.Int128).sum().cast(pl.Int64, strict=True) if t == DType.INT64 else v.sum()
+            if t.is_decimal:
+                f = v.cast(pl.Float64)
+                total = _checked_decimal(total, f.sum(), f.abs().sum(), t.scale)
             return pl.when(v.count() == 0).then(None).otherwise(total)
         if fn == "max" and t.is_float:  # contract: NaN is the largest value
             return pl.when(v.is_nan().any()).then(pl.lit(float("nan"))).otherwise(v.max())
@@ -345,6 +425,9 @@ class PolarsBackend(Backend):
             zero = pl.lit(0).cast(_pl_dtype(t))
             filled = v.fill_null(zero)
             running = filled.cast(pl.Int128).cum_sum().cast(pl.Int64, strict=True) if t == DType.INT64 else filled.cum_sum()
+            if t.is_decimal:
+                f = filled.cast(pl.Float64)
+                running = _checked_decimal(running, f.cum_sum(), f.abs().cum_sum(), t.scale)
             base = pl.when(v.cum_count() == 0).then(None).otherwise(running)
         elif fn == "shift":
             base = self._expr(inner.operand, schema).shift(inner.param)

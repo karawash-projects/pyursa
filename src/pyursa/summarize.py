@@ -44,6 +44,9 @@ def default_token_count(text: str) -> int:
     return math.ceil(len(text) / 4)
 
 
+MAX_TOP_SCANS = 20  # columns that get a top-values query
+
+
 def profile(frame: "Frame", backend: str | None = None, top_k: int = 3,
             sample_rows: int = 3, max_columns: int = 50, redact: bool = False) -> dict[str, Any]:
     schema = frame.schema
@@ -66,6 +69,7 @@ def profile(frame: "Frame", backend: str | None = None, top_k: int = 3,
 
     columns = []
     warnings: list[str] = []
+    top_scans = 0
     for i, n in enumerate(names):
         t = schema[n]
         info: dict[str, Any] = {
@@ -76,7 +80,10 @@ def profile(frame: "Frame", backend: str | None = None, top_k: int = 3,
         for k in ("min", "max", "mean"):
             if f"{i}__{k}" in stats:
                 info[k] = stats[f"{i}__{k}"]
-        if t in (DType.STRING, DType.BOOLEAN) and rows and top_k:
+        non_null = rows - (info.get("nulls") or 0)
+        all_unique = info.get("distinct") is not None and info["distinct"] == non_null and non_null > top_k
+        if t in (DType.STRING, DType.BOOLEAN) and rows and top_k and not all_unique and top_scans < MAX_TOP_SCANS:
+            top_scans += 1  # one grouped query per column; skipped for ID-like columns where every value is unique
             top = (frame.filter(col(n).is_not_null())
                    .group_by(n).agg(len_().alias("__n"))
                    .sort("__n", n, descending=[True, False]).head(top_k)
@@ -89,6 +96,13 @@ def profile(frame: "Frame", backend: str | None = None, top_k: int = 3,
         if flagged and not any(w.startswith(f"Column '{n}'") for w in warnings):
             warnings.append(f"Column '{n}' has {flagged:,} value(s) that look like instructions to an AI.")
         columns.append(info)
+
+    for n in names:
+        if _INJECTION.search(str(n)) or "\n" in str(n):
+            warnings.append(f"Column name {_short(str(n), 60)!r} looks like instructions to an AI or contains a line break.")
+    for src in sources(frame.plan):
+        if _INJECTION.search(str(src.name)) or "\n" in str(src.name):
+            warnings.append(f"Dataset name {_short(str(src.name), 60)!r} looks like instructions to an AI.")
 
     sample = frame.head(sample_rows).select(names).to_dicts(backend) if sample_rows else []
     for r in sample:
@@ -123,6 +137,13 @@ def _short(v: str, n: int) -> str:
     return v if len(v) <= n else v[: n - 1] + "…"
 
 
+def _name(n: Any, width: int = 60) -> str:
+    """A column or dataset name made safe for one markdown table cell: names come from file headers,
+    so they are untrusted text like any cell value."""
+    s = str(n).replace("\r", " ").replace("\n", "⏎").replace("|", "\\|").replace("`", "'")
+    return _short(s, width)
+
+
 def _cell(v: Any, width: int = 28, exact: bool = False) -> str:
     """Format a value for a markdown table. exact=True keeps full numeric precision (previews)."""
     import decimal as _decimal
@@ -154,17 +175,17 @@ def render(p: dict[str, Any], level: int, max_cols: int | None = None) -> str:
     """level 3 = stats + top values + sample rows, 2 = no samples, 1 = no top values, 0 = schema only."""
     cols = p["columns"] if max_cols is None else p["columns"][:max_cols]
     hidden = len(p["columns"]) - len(cols) + len(p["omitted_columns"])
-    out = [f"## Dataset `{p['name']}`: {p['rows']:,} rows × {p['n_columns']} columns"]
+    out = [f"## Dataset `{_name(p['name'])}`: {p['rows']:,} rows × {p['n_columns']} columns"]
     if p["steps"]:
-        out.append("Transformations: " + " → ".join(p["steps"]))
+        out.append("Transformations: " + " → ".join(_name(st, 200) for st in p["steps"]))
     if p["warnings"]:
-        out += [""] + ["⚠ " + w for w in p["warnings"]]
+        out += [""] + ["⚠ " + _name(w, 300) for w in p["warnings"]]
     out.append("")
     if level == 0:
         out.append("| column | type | nulls |")
         out.append("|---|---|---|")
         for c in cols:
-            out.append(f"| {c['name']} | {c['dtype']} | {c['nulls']:,} |")
+            out.append(f"| {_name(c['name'])} | {c['dtype']} | {c['nulls']:,} |")
     else:
         head = "| column | type | nulls | distinct | min | max | mean |"
         sep = "|---|---|---|---|---|---|---|"
@@ -173,7 +194,7 @@ def render(p: dict[str, Any], level: int, max_cols: int | None = None) -> str:
         out += [head, sep]
         for c in cols:
             distinct = "" if c["distinct"] is None else f"{c['distinct']:,}"
-            row = (f"| {c['name']} | {c['dtype']} | {c['nulls']:,} | {distinct} | "
+            row = (f"| {_name(c['name'])} | {c['dtype']} | {c['nulls']:,} | {distinct} | "
                    f"{_cell(c.get('min')) if 'min' in c else ''} | {_cell(c.get('max')) if 'max' in c else ''} | "
                    f"{_cell(c.get('mean')) if 'mean' in c else ''} |")
             if level >= 2:
@@ -184,7 +205,7 @@ def render(p: dict[str, Any], level: int, max_cols: int | None = None) -> str:
         out.append(f"| … {hidden} more columns not shown | | |")
     if level >= 3 and p["sample"]:
         names = [c["name"] for c in cols]
-        out += ["", f"Sample rows (first {len(p['sample'])}):", "| " + " | ".join(names) + " |",
+        out += ["", f"Sample rows (first {len(p['sample'])}):", "| " + " | ".join(_name(n, 30) for n in names) + " |",
                 "|" + "---|" * len(names)]
         for r in p["sample"]:
             out.append("| " + " | ".join(_cell(r.get(n), 20) for n in names) + " |")

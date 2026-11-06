@@ -42,7 +42,13 @@ Design rules:
 - Every call returns `{"ok": true, ...}` or `{"ok": false, "error": {...}}`; nothing raises.
   Transform errors include `step_index`.
 - Expressions are parsed by a whitelisted parser; no code is executed.
-- Files are confined to `roots` (symlinks and glob matches are checked individually).
+- Files are confined to `roots`, which are required (there is no default folder). Symlinks and glob
+  matches are checked individually, and patterns are only expanded inside a root.
+- Hidden files and folders (names starting with `.`, such as `.env` or `.git`) are never readable or writable.
+- Sessions are read-only unless created with `allow_write=True` (`--allow-write`); `export` only writes
+  `.parquet`, `.csv` and `.json` files.
+- CSV/JSON loads are capped by `max_load_bytes` (2 GB by default, `--max-load-mb`), because those
+  formats are read into memory; Parquet is scanned lazily.
 - `preview` caps at 50 rows and returns exact numbers plus JSON rows.
 
 Call `s.help()` for the full expression syntax and step formats.
@@ -50,7 +56,8 @@ Call `s.help()` for the full expression syntax and step formats.
 ## MCP server
 
 ```bash
-pyursa-mcp --root ./data                                   # stdio, one client
+pyursa-mcp --root ./data                                   # stdio, one client, read-only
+pyursa-mcp --root ./data --allow-write                     # also let the agent export files into ./data
 pyursa-mcp --root ./data --transport streamable-http --port 8000   # many clients
 pyursa-mcp --root ./data --llm gemini:gemini-3.8-flash --llm-price 0.10,0.50 --redact-pii
 ```
@@ -66,7 +73,9 @@ Tools: `load_file`, `describe`, `transform`, `preview`, `count_rows`, `explain`,
 `pyursa_help`.
 
 **Isolation.** Each connected client gets its own session: frames, LLM cache and usage
-reports are never shared (verified by a two-client HTTP test). Only server-wide settings
+reports are never shared (verified by a two-client HTTP test). A session is freed when its client
+disconnects, calls within a session run one at a time, and a call without a client connection is
+refused rather than given a shared session. Only server-wide settings
 and an explicit `--llm-cache` file are shared.
 
 **Security.** The HTTP transport has no authentication and binds to `127.0.0.1` by

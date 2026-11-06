@@ -138,7 +138,10 @@ def test_traversal_and_absolute_paths_blocked(sandbox):
         r = s.load_file(bad)
         assert r["ok"] is False and r["error"]["error"] in ("PATH_NOT_ALLOWED", "FILE_NOT_FOUND"), (bad, r)
     h = s.load_file("ok.parquet")["handle"]
-    assert s.export(h, "../secret/out.parquet")["error"]["error"] == "PATH_NOT_ALLOWED"
+    assert s.export(h, "../secret/out.parquet")["error"]["error"] == "READ_ONLY"  # read-only by default
+    w = ToolSession(roots=[root], allow_write=True)
+    hw = w.load_file("ok.parquet")["handle"]
+    assert w.export(hw, "../secret/out.parquet")["error"]["error"] == "PATH_NOT_ALLOWED"
     assert not (outside / "out.parquet").exists()
 
 

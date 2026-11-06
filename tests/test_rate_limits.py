@@ -42,7 +42,7 @@ def test_daily_quota_fails_fast_with_clear_hint(monkeypatch):
         calls.append(1)
         raise _err(429, GEMINI_DAY)
 
-    monkeypatch.setattr(P.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(P, "_urlopen", fake_urlopen)
     monkeypatch.setattr(P.time, "sleep", sleeps.append)
     c = P.OpenAICompatibleClient("gemini-x", provider="gemini", api_key="k", max_attempts=4)
     with pytest.raises(pu.LLMProviderError) as ei:
@@ -65,7 +65,7 @@ def test_minute_limit_waits_as_told_then_succeeds(monkeypatch):
             raise _err(429, GEMINI_MINUTE)
         return Resp(json.dumps({"choices": [{"message": {"content": "ok"}}], "usage": {}}).encode())
 
-    monkeypatch.setattr(P.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(P, "_urlopen", fake_urlopen)
     monkeypatch.setattr(P.time, "sleep", sleeps.append)
     c = P.OpenAICompatibleClient("gemini-x", provider="gemini", api_key="k", max_attempts=4)
     assert c.complete("s", "hi") == "ok" and sleeps == [7.0]

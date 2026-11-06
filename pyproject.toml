@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pyursa"
-version = "1.0.1"
+dynamic = ["version"]
 description = "Engine-agnostic dataframes for agentic AI: strict types, identical results on Polars and DuckDB, structured errors, undo, lineage, LLM operators and an MCP server."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -13,7 +13,7 @@ license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "The pyursa authors" }]
 keywords = ["dataframe", "agents", "llm", "mcp", "polars", "duckdb", "arrow", "data-engineering"]
 classifiers = [
-    "Development Status :: 5 - Production/Stable",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "Operating System :: OS Independent",
@@ -47,6 +47,9 @@ Issues = "https://github.com/karawash-projects/pyursa/issues"
 
 [project.scripts]
 pyursa-mcp = "pyursa.mcp_server:main"
+
+[tool.hatch.version]
+path = "src/pyursa/__init__.py"  # the single place the version is written
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pyursa"]

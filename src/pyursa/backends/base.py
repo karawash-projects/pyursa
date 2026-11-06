@@ -29,7 +29,9 @@ SEMANTICS = {
     "distinct": "distinct() keeps the first occurrence of each row (or subset) in input order; nulls compare equal.",
     "concat": "concat() returns all rows of the first frame, then the second, and so on.",
     "rounding": "round() rounds half away from zero (2.5 -> 3, -2.5 -> -3).",
-    "decimals": "Decimal +,-,* are exact (scale: max for +/-, sum for *); / returns Float64; sum keeps the scale; mean/median/std return Float64.",
+    "decimals": "Decimal +,-,* are exact with result Decimal(38, s) (s: max scale for +/-, sum of scales for *); results, sums and running totals that need more than 38 digits raise DECIMAL_OVERFLOW, never wrap; comparing a column with a literal that has more decimal places is exact; / returns Float64; sum keeps the scale; mean/median/std return Float64.",
+    "files": "Parquet columns are read as their declared pyursa type (category -> String, int8-32 -> Int64, float32 -> Float64, s/ms timestamps -> microseconds) on every engine, so a file gives the same results as the same data in memory. CSV: only empty fields are missing; text such as 'NA' or 'null' is kept. JSON output is strict: NaN/inf are written as null.",
+    "regex": "contains_regex uses the syntax common to RE2 and Rust regex. Lookaround, backreferences and the Unicode-dependent classes \\d \\w \\s \\b are rejected; use explicit classes such as [0-9].",
     "quantiles": "median()/quantile(q) use linear interpolation; std()/var() are sample statistics (ddof=1).",
     "windows": "Window results keep input row order; ties in order_by keep input order; rank() is SQL RANK with nulls last; cum_sum skips nulls.",
     "time_zones": "Datetime(tz) keeps its zone; .dt parts are computed in that zone; comparing different zones is an error.",
@@ -39,7 +41,7 @@ SEMANTICS = {
     "integer_overflow": "Int64 arithmetic, sums and running totals that leave the Int64 range raise INTEGER_OVERFLOW; they never wrap around.",
     "casts": "Casts are strict and identical everywhere: text is trimmed of spaces/tabs/newlines and must then be a valid literal (integers like '+12', floats like '1e3', 'inf' or 'nan', decimals with up to 20 integer digits and 17 places, booleans 'true'/'false'/'1'/'0', dates 'YYYY-MM-DD', datetimes 'YYYY-MM-DD HH:MM[:SS[.ffffff]]' with ' ' or 'T', years 0001-9999, hours 00-23, no leap seconds); anything else raises CAST_FAILED. Float or Decimal to Int64 requires a whole number. Conversions to Decimal round half away from zero. Floats print as text that converts back to the exact same value ('NaN', 'inf'; notation such as '0.00001' vs '1e-5' can differ between engines); datetimes print as 'YYYY-MM-DD HH:MM:SS[.ffffff]'. Casts that have no single meaning (dates to numbers, floats to Boolean, changing a time zone) are rejected when the plan is built.",
     "names": "Column names must differ by more than letter case, must not contain NUL, and must not start with the reserved prefix '__pu_'.",
-    "float_precision": "Float sums and means can differ in the last digits (about 1e-15 relative) between engines because they add in different orders; every other result is identical.",
+    "float_precision": "Float sums and means can differ in the last digits (about 1e-15 relative) between engines because they add in different orders. Float-to-text notation can differ ('0.00001' vs '1e-5') but always converts back to the same value. Every other result is identical.",
     "known_differences": "Rare cases engines still differ on, by design of the engines: upper()/lower() of a few special characters (e.g. 'ß', 'İ'), and DuckDB may return -0.0 as 0.0 after sorting.",
 }
 
@@ -88,6 +90,15 @@ def engine_error(backend: "Backend", node: Node, exc: BaseException) -> BackendE
             "A floating-point value isn't a whole number (or is NaN/inf), so it can't become Int64.",
             details=details, code="CAST_FAILED",
             suggestions=[{"description": "Round first.", "fix": 'col("x").round(0).cast("Int64")'}],
+        )
+    if ("more than 38 digits" in low or "hugeint addition" in low or "7777777777" in low
+            or ("decimal" in low and any(k in low for k in ("overflow", "out of range", "conversion from `decimal",
+                                                           "can't fit values")))):
+        return BackendError(
+            "A decimal value or result needs more digits than its type allows (at most 38).",
+            details=details, code="DECIMAL_OVERFLOW",
+            suggestions=[{"description": "Round to fewer decimal places first, or compute in Float64 if exact "
+                                         "digits aren't needed.", "fix": 'col("x").cast("Float64")'}],
         )
     if ("overflow" in low or ("i128" in low and "i64" in low)
             or ("out of range" in low and any(k in low for k in ("int64", "bigint", "integer", "hugeint")))):

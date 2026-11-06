@@ -56,6 +56,10 @@ class DType:
             )
         self = object.__new__(cls)
         object.__setattr__(self, "kind", kind)
+        if kind == "Datetime" and tz is not None:
+            if not isinstance(tz, str) or not tz.strip():
+                raise UnsupportedTypeError(f"Datetime time zone must be a non-empty name, got {tz!r}.")
+            tz = normalize_tz(tz.strip())
         object.__setattr__(self, "tz", tz)
         if kind == "Decimal":
             precision = MAX_DECIMAL_PRECISION if precision is None else precision
@@ -383,8 +387,11 @@ def normalize_tz(tz: str | None) -> str | None:
         return None
     m = _OFFSET.match(tz.strip())
     if not m:
+        _check_zone(tz)
         return tz
     sign, hours, minutes = m.group(1), int(m.group(2)), int(m.group(3) or 0)
+    if (sign == "+" and hours > 14) or (sign == "-" and hours > 12):
+        raise UnsupportedTypeError(f"UTC offset '{tz}' is outside the valid range (-12:00 to +14:00).")
     if minutes:
         raise UnsupportedTypeError(
             f"Fixed UTC offset '{tz}' is not supported by every engine.",
@@ -393,6 +400,20 @@ def normalize_tz(tz: str | None) -> str | None:
     if hours == 0:
         return "UTC"
     return f"Etc/GMT{'-' if sign == '+' else '+'}{hours}"  # Etc/GMT signs are inverted by convention
+
+
+def _check_zone(tz: str) -> None:
+    """Reject time-zone names that don't exist (when a time-zone database is available to check)."""
+    import zoneinfo
+    try:
+        zoneinfo.ZoneInfo(tz)
+    except (zoneinfo.ZoneInfoNotFoundError, ValueError):
+        if tz.upper() == "UTC" or not zoneinfo.available_timezones():  # no tz database here: can't check
+            return
+        raise UnsupportedTypeError(
+            f"Unknown time zone {tz!r}.",
+            suggestions=[{"description": "Use an IANA zone name such as 'UTC', 'America/Toronto' or 'Europe/Paris'."}],
+        ) from None
 
 
 def tz_name(tzinfo: Any) -> str | None:
@@ -444,4 +465,7 @@ def arithmetic_type(op: str, a: DType, b: DType) -> DType | None:
         if scale > MAX_DECIMAL_PRECISION:
             return None
         return Decimal(MAX_DECIMAL_PRECISION, scale)
+    if op in ("+", "-") and (a.is_decimal or b.is_decimal) and DType.FLOAT64 not in (a, b):
+        # sums and differences can need one more digit than either input: always Decimal(38, max scale)
+        return Decimal(MAX_DECIMAL_PRECISION, max(t.scale for t in (a, b) if t.is_decimal))  # type: ignore[type-var]
     return common_type(a, b)
