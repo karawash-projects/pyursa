@@ -360,6 +360,8 @@ Constants: `pu.Int64`, `pu.Float64`, `pu.String`, `pu.Boolean`, `pu.Date`, `pu.D
 
 ### `pu.available_backends() -> list[str]`
 
+Engines that can run here (registered and installed).
+
 ### `pu.default_backend() -> str`
 
 ### `pu.set_default_backend(name: str) -> None`
@@ -404,7 +406,7 @@ Any server implementing POST {base_url}/chat/completions.
 Use a preset (provider="groq") or any URL (base_url="https://host/v1"). URL placeholders such as
 {account_id} or {resource} can be passed as keyword arguments or come from the environment.
 
-### `pu.AnthropicClient(model: str = claude-haiku-5-5, max_tokens: int = 8192, api_key: str | None = None, client: Any = None) -> None`
+### `pu.AnthropicClient(model: str = claude-haiku-5-5, max_tokens: int = 8192, api_key: str | None = None, client: Any = None, *, base_url: str | None = None, timeout: float | None = None, max_attempts: int | None = None, **unused: Any) -> None`
 
 Claude via the Anthropic API (`pip install anthropic`, ANTHROPIC_API_KEY set).
 

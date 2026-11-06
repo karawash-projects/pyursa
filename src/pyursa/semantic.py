@@ -179,6 +179,15 @@ def _json_for_prompt(value: Any) -> str:
             .replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e"))
 
 
+class _FailedItem:
+    """One item a client couldn't answer; carries the error so the step's report can show it."""
+
+    __slots__ = ("error",)
+
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+
+
 class FunctionClient(LLMClient):
     """Wrap any Python callable (another model, a rules engine, a test stub).
     `fn(row) -> dict | scalar`; a scalar is used for single-field tasks."""
@@ -209,12 +218,12 @@ class FunctionClient(LLMClient):
                 v = self.fn(item)
             except Exception as e:
                 first_error = first_error or e
-                out.append(None)
+                out.append(_FailedItem(e))
                 continue
             if not isinstance(v, dict):
                 v = {next(iter(task.fields)): v}
             out.append(v)
-        if first_error is not None and all(v is None for v in out):
+        if first_error is not None and all(isinstance(v, _FailedItem) for v in out):
             raise first_error
         return out
 
@@ -307,13 +316,25 @@ class AnthropicClient(PromptClient):
     """Claude via the Anthropic API (`pip install anthropic`, ANTHROPIC_API_KEY set)."""
 
     def __init__(self, model: str = "claude-haiku-5-5", max_tokens: int = 8192,
-                 api_key: str | None = None, client: Any = None) -> None:
+                 api_key: str | None = None, client: Any = None, *, base_url: str | None = None,
+                 timeout: float | None = None, max_attempts: int | None = None, **unused: Any) -> None:
+        """base_url, timeout and max_attempts are passed to the Anthropic SDK (max_attempts = 1 + retries)."""
+        if unused:
+            raise InvalidOperationError(f"AnthropicClient doesn't take {', '.join(sorted(unused))}.", code="BAD_ARGUMENTS",
+                                        suggestions=[{"description": "Supported: model, max_tokens, api_key, base_url, timeout, max_attempts."}])
         if client is None:
             try:
                 import anthropic
             except ImportError as e:  # pragma: no cover
                 raise ImportError("AnthropicClient needs `pip install anthropic`.") from e
-            client = anthropic.Anthropic(api_key=api_key)
+            opts: dict[str, Any] = {"api_key": api_key}
+            if base_url is not None:
+                opts["base_url"] = base_url
+            if timeout is not None:
+                opts["timeout"] = timeout
+            if max_attempts is not None:
+                opts["max_retries"] = max(0, int(max_attempts) - 1)
+            client = anthropic.Anthropic(**opts)
         self._client, self.model, self.max_tokens = client, model, max_tokens
         self.model_id = f"anthropic:{model}"
 
@@ -692,6 +713,9 @@ def run_semantic(node: SemanticOp, table: pa.Table) -> pa.Table:
                     failed_batches += 1
                     results = []
                 for k, res in zip(batch, list(results) + [None] * (len(batch) - len(results))):
+                    if isinstance(res, _FailedItem):
+                        errors.append(res.error)
+                        res = None
                     value, ok = _coerce_answer(res, task.fields)
                     answers[k] = value
                     if ok:

@@ -58,6 +58,38 @@ jobs:
       - run: pip list
       - run: python -m pytest -q
 
+  journeys:
+    name: end-to-end journeys (${{ matrix.os }}, ${{ matrix.deps }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, python: "3.13", deps: latest }
+          - { os: ubuntu-latest, python: "3.10", deps: oldest }
+          - { os: windows-latest, python: "3.13", deps: latest }
+          - { os: macos-latest, python: "3.13", deps: latest }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install build
+      - run: python -m build --wheel -o dist
+      - name: Install the built wheel (as a user would)
+        shell: bash
+        run: |
+          WHEEL=$(ls dist/*.whl)
+          if [ "${{ matrix.deps }}" = "oldest" ]; then
+            pip install -c ci/constraints-min.txt "${WHEEL}[all,mcp]" pandas numpy
+          else
+            pip install "${WHEEL}[all,mcp]" pandas numpy
+          fi
+          echo "PYURSA_WHEEL=$(pwd)/${WHEEL}" >> "$GITHUB_ENV"
+      - name: Run the journeys against the installed package
+        working-directory: ${{ runner.temp }}
+        run: python "${{ github.workspace }}/scripts/journeys/run.py"
+
   minimum-versions:
     name: test (oldest supported dependencies)
     runs-on: ubuntu-latest

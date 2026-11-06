@@ -69,17 +69,30 @@ class Source(Node):
             self.paths = _expand_paths(path)
             self._rows = sum(pq.read_metadata(p).num_rows for p in self.paths)
             self._arrow_schema = pq.read_schema(self.paths[0])
+            self._file_schemas = [self._arrow_schema]
+            first = schema_from_arrow(self._arrow_schema)
             for p in self.paths[1:]:
                 other = pq.read_schema(p)
-                if not other.equals(self._arrow_schema, check_metadata=False):
+                self._file_schemas.append(other)
+                if other.equals(self._arrow_schema, check_metadata=False):
+                    continue
+                # Different writers store the same data differently (category vs string, int32 vs int64,
+                # ms vs us timestamps). That's fine as long as every file has the same pyursa schema.
+                theirs = schema_from_arrow(other)
+                if dict(theirs) != dict(first):
+                    diff = sorted(set(first) ^ set(theirs)) or [n for n in first if first[n] != theirs.get(n)]
                     raise TypeMismatchError(
-                        f"Parquet files have different schemas: {self.paths[0]} vs {p}.",
-                        details={"first": str(self._arrow_schema), "other": str(other), "file": p},
+                        f"Parquet files have different columns or types: {self.paths[0]} vs {p} (differs in {', '.join(map(str, diff[:5]))}).",
+                        details={"first": {k: str(v) for k, v in first.items()},
+                                 "other": {k: str(v) for k, v in theirs.items()}, "file": p},
                         suggestions=[{"description": "Load the files separately, align types with cast(), then concat()."}],
                     )
+            self.mixed_files = any(not f.equals(self._arrow_schema, check_metadata=False) for f in self._file_schemas)
         else:
             self._rows = self.table.num_rows  # type: ignore[union-attr]
             self._arrow_schema = self.table.schema  # type: ignore[union-attr]
+            self._file_schemas = []
+            self.mixed_files = False
         super().__init__()
 
     @property
@@ -119,8 +132,12 @@ class Source(Node):
         category, ms timestamps); engines then cast it on read so results don't depend on the file."""
         if not self.paths:
             return False
-        f = self._arrow_schema.field(name) if name in self._arrow_schema.names else None
-        return f is not None and not f.type.equals(self.schema[name].to_arrow())
+        want = self.schema[name].to_arrow()
+        for fs in self._file_schemas or [self._arrow_schema]:
+            f = fs.field(name) if name in fs.names else None
+            if f is not None and not f.type.equals(want):
+                return True
+        return False
     def params(self):
         if self.paths:
             where = f"path={self.paths[0]!r}" if len(self.paths) == 1 else f"files={len(self.paths)}"

@@ -32,11 +32,9 @@ INJECTION_MARKERS = ["ignore previous", "ignore all previous", "ignore prior", "
 
 
 def _suspicious(c):
-    lowered = c.str.lower()
-    e = lowered.str.contains(INJECTION_MARKERS[0])
-    for m in INJECTION_MARKERS[1:]:
-        e = e | lowered.str.contains(m)
-    return e
+    """One case-insensitive pass over the column for every marker (instead of one pass per marker)."""
+    pattern = "(?i)(?:" + "|".join(re.escape(m) for m in INJECTION_MARKERS) + ")"
+    return c.str.contains_regex(pattern)
 
 
 def default_token_count(text: str) -> int:

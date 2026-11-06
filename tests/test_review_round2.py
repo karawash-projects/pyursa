@@ -193,3 +193,74 @@ def test_read_csv_edge_cases(tmp_path):
     (tmp_path / "x.csv").write_text("a\nabc\n")
     with pytest.raises(pu.PyursaError):
         pu.read_csv(str(tmp_path / "x.csv"), schema={"a": "Int64"})
+
+
+# --- found by the end-to-end journeys ---------------------------------------------------------------
+def test_missing_engine_is_a_structured_error(monkeypatch):
+    from pyursa.backends import base
+    monkeypatch.setattr(base, "_installed", lambda name: False)
+    with pytest.raises(pu.PyursaError) as ei:
+        pu.from_dict({"x": [1]}).collect()
+    assert ei.value.code == "ENGINE_NOT_INSTALLED" and 'pyursa[all]' in ei.value.suggestions[-1]["fix"]
+    with pytest.raises(pu.PyursaError) as ei:
+        pu.from_dict({"x": [1]}).collect("duckdb")
+    assert ei.value.code == "ENGINE_NOT_INSTALLED" and "pyursa[duckdb]" in ei.value.suggestions[0]["fix"]
+
+
+def test_default_engine_falls_back_to_an_installed_one(monkeypatch):
+    from pyursa.backends import base
+    monkeypatch.setattr(base, "_installed", lambda name: name == "duckdb")
+    monkeypatch.setattr(base, "_DEFAULT", ["polars"])
+    assert pu.from_dict({"x": [1, 2]}).select(col("x").sum()).to_dicts() == [{"x": 3}]
+    assert pu.available_backends() == ["duckdb"]
+
+
+def test_phone_at_end_of_sentence_is_redacted():
+    from pyursa.redact import redact_text
+    assert "416" not in redact_text("Call me at 416-555-0199.")
+    assert redact_text("pi is 3.14159.") == "pi is 3.14159."
+
+
+def test_partial_failures_keep_their_messages():
+    c = FunctionClient(lambda r: 1 / 0 if r["x"] == 2 else 1, model_id="div")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        pu.from_dict({"x": [1, 2]}).llm_map("x", output="o", dtype="Int64", inputs=["x"], client=c).collect()
+    assert any("ZeroDivisionError" in e for e in pu.llm_reports()[-1]["errors"])
+
+
+def test_anthropic_spec_accepts_common_options():
+    client = pu.llm_client("anthropic:claude-haiku-5-5", base_url="http://127.0.0.1:9/v1", timeout=5, api_key="k")
+    assert client is not None
+
+
+def test_parquet_lake_from_different_writers(tmp_path):
+    pl = pytest.importorskip("polars")
+    lake = tmp_path / "lake"
+    lake.mkdir()
+    pq.write_table(pa.table({"id": pa.array([1, 2], pa.int32()),
+                             "k": pa.array(["a", "b"]).dictionary_encode(),
+                             "v": pa.array([1.5, float("nan")], pa.float32()),
+                             "t": pa.array([0, 1000], pa.timestamp("ms"))}), lake / "a.parquet")
+    pl.DataFrame({"id": [3], "k": ["c"], "v": [2.5], "t": [dt.datetime(1970, 1, 1, 0, 0, 2)]}).with_columns(
+        pl.col("k").cast(pl.Categorical)).write_parquet(lake / "b.parquet")
+    f = pu.read_parquet(str(lake))
+    assert {k: str(v) for k, v in f.schema.items()} == {"id": "Int64", "k": "String", "v": "Float64", "t": "Datetime"}
+    rows = {b: f.sort("id").to_dicts(b) for b in BACKENDS}
+    for b in BACKENDS:
+        assert [r["id"] for r in rows[b]] == [1, 2, 3] and [r["k"] for r in rows[b]] == ["a", "b", "c"]
+        assert f.filter(col("k") == "c").count(b) == 1
+
+
+def test_parquet_files_with_different_types_still_refused(tmp_path):
+    pq.write_table(pa.table({"id": [1]}), tmp_path / "a.parquet")
+    pq.write_table(pa.table({"id": ["x"]}), tmp_path / "b.parquet")
+    with pytest.raises(pu.PyursaError) as ei:
+        pu.read_parquet(str(tmp_path))
+    assert "differ" in ei.value.message
+
+
+def test_duckdb_queries_raise_no_warnings():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        pu.from_dict({"x": [1, 2]}).filter(col("x") > 1).to_dicts(backend="duckdb")

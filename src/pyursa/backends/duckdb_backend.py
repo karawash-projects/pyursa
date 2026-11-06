@@ -181,7 +181,8 @@ class _Compiler:
                     name = f"src_{node.uid}"
                     self.tables[name] = pads.dataset(list(node.paths), format="parquet")
                     return f"SELECT {cols} FROM {name}"
-                return f"SELECT {cols} FROM read_parquet([{', '.join(self.lit(p) for p in node.paths)}])"
+                opts = ", union_by_name = true" if getattr(node, "mixed_files", False) else ""
+                return f"SELECT {cols} FROM read_parquet([{', '.join(self.lit(p) for p in node.paths)}]{opts})"
             name = f"src_{node.uid}"
             self.tables[name] = node.table
             return f"SELECT {cols} FROM {name}"
@@ -525,12 +526,14 @@ class DuckDBBackend(Backend):
                 con.execute("SET disabled_optimizers = 'filter_pushdown,statistics_propagation'")
             for name, table in c.tables.items():
                 con.register(name, table)
-            for method in ("to_arrow_table", "fetch_arrow_table"):  # duckdb >= 1.5 / older 1.x
-                if hasattr(con, method):
-                    res = con.execute(sql, params) if params else con.execute(sql)
-                    return getattr(res, method)()
-            # duckdb 2.0 previews removed Arrow fetching from the connection; relations still have it
+            # A relation gives Arrow directly; fetching Arrow from an executed DB-API result makes an extra
+            # copy (DuckDB 2.0 warns about it on every query, and its previews removed it entirely).
             rel = con.sql(sql, params=params) if params else con.sql(sql)
-            return rel.to_arrow_table()
+            for method in ("to_arrow_table", "arrow", "fetch_arrow_table"):  # newest name first
+                fetch = getattr(rel, method, None)
+                if fetch is not None:
+                    out = fetch()
+                    return out.read_all() if isinstance(out, pa.RecordBatchReader) else out
+            raise RuntimeError("this DuckDB version has no Arrow export")
         finally:
             con.close()

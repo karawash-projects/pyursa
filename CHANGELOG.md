@@ -87,6 +87,24 @@ verifying it. Several bugs returned wrong answers without an error; upgrading is
 - Remaining engine differences (Polars 1.x decimal limits, `-0.0` vs `0.0`) are listed in
   `pu.SEMANTICS["known_differences"]`.
 
+### Fixed (end-to-end journeys)
+- A Parquet folder written by different tools (PyArrow dictionary columns, Polars categoricals, DuckDB,
+  int32 vs int64, ms vs us timestamps) was refused as "different schemas". Files now load together as long
+  as they have the same pyursa types; each file is conformed on read.
+- DuckDB 2.0 printed a warning on every query (an extra copy of the result); results are fetched without it.
+- Without an engine installed, queries failed with a raw `ImportError`; they now raise `ENGINE_NOT_INSTALLED`
+  with `pip install "pyursa[all]"`, and the default engine falls back to whichever one is installed.
+- `describe_for_llm` scanned each text column once per prompt-injection marker; one pass now (4× faster
+  on 3 million rows).
+- PII redaction missed a phone number at the end of a sentence ("call 416-555-0199.").
+- Per-row `FunctionClient` errors were missing from `llm_reports()[...]["errors"]`.
+- `llm_client("anthropic:...", base_url=..., timeout=...)` raised a raw `TypeError`.
+
+### Added
+- `scripts/journeys/`: end-to-end user journeys (analyst, data engineer, error recovery, LLM pipelines,
+  provider HTTP paths, MCP over stdio and HTTP, scale, packaging) that run against the installed wheel.
+  CI runs them on Linux, macOS and Windows with the newest and the oldest supported dependencies.
+
 ### Changed
 - Development status is back to Beta until a follow-up review comes back clean.
 - The version is defined once (`pyursa.__version__`); releases check that the tag matches and run the tests.

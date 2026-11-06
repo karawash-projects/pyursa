@@ -125,6 +125,14 @@ class PolarsBackend(Backend):
                 # min/max statistics ignore NaN; older Polars prunes NaN rows with them, so don't use them
                 # for files with float columns
                 stats = not any(t.kind == "Float64" or (t.kind in ("List", "Struct")) for t in node.schema.values())
+                if getattr(node, "mixed_files", False):  # files stored differently: conform each, then stack
+                    parts = []
+                    for path in node.paths:
+                        one = pl.scan_parquet(path, glob=False, use_statistics=stats)
+                        read = one.collect_schema()
+                        fix = {n: _pl_dtype(t) for n, t in node.schema.items() if read.get(n) != _pl_dtype(t)}
+                        parts.append((one.cast(fix, strict=True) if fix else one).select(list(node.schema)))
+                    return pl.concat(parts, how="vertical")
                 lf = pl.scan_parquet(node.paths if len(node.paths) > 1 else node.paths[0], glob=False,
                                      use_statistics=stats)
                 # Files keep their own types (category, int32, float32, ms timestamps); conform them to the

@@ -154,18 +154,46 @@ def register_backend(name: str, factory: Callable[[], Backend]) -> None:
     _INSTANCES.pop(name, None)
 
 
+_ENGINE_MODULES = {"polars": "polars", "duckdb": "duckdb"}
+
+
+def _installed(name: str) -> bool:
+    import importlib.util
+    mod = _ENGINE_MODULES.get(name)
+    return mod is None or importlib.util.find_spec(mod) is not None  # custom backends count as installed
+
+
 def available_backends() -> list[str]:
-    return sorted(_REGISTRY)
+    """Engines that can run here (registered and installed)."""
+    return sorted(n for n in _REGISTRY if _installed(n))
+
+
+def _install_hint(name: str | None = None) -> list[dict[str, str]]:
+    hints = [{"description": "Install both engines.", "fix": 'pip install "pyursa[all]"'}]
+    if name in _ENGINE_MODULES:
+        hints.insert(0, {"description": f"Install the {name} engine.", "fix": f'pip install "pyursa[{name}]"'})
+    return hints
 
 
 def get_backend(name: str | None = None) -> Backend:
+    explicit = name is not None
     name = name or _DEFAULT[0]
     if name not in _REGISTRY:
         raise UnknownBackendError(
             f"Unknown backend '{name}'.",
             details={"requested": name, "available": available_backends()},
-            suggestions=[{"description": f"Use one of: {', '.join(available_backends())}."}],
+            suggestions=[{"description": f"Use one of: {', '.join(available_backends()) or 'polars, duckdb'}."}],
         )
+    if not _installed(name):
+        others = available_backends()
+        if not explicit and others:  # the default engine isn't installed: use one that is
+            name = others[0]
+        else:
+            raise BackendError(
+                f"The {name} engine isn't installed." if explicit else
+                "pyursa needs an engine to run queries, and neither Polars nor DuckDB is installed.",
+                code="ENGINE_NOT_INSTALLED", details={"requested": name, "available": others},
+                suggestions=_install_hint(name if explicit else None))
     if name not in _INSTANCES:
         _INSTANCES[name] = _REGISTRY[name]()
     return _INSTANCES[name]
