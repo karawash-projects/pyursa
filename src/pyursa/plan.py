@@ -14,6 +14,7 @@ from .errors import (
     DuplicateColumnError,
     InvalidOperationError,
     TypeMismatchError,
+    UnsupportedTypeError,
     column_not_found,
 )
 from .expr import Col, Expr, col_src, unalias
@@ -86,6 +87,32 @@ class Source(Node):
         return self.paths[0] if len(self.paths) == 1 else (None if not self.paths else self.paths[0])
 
     def _compute_schema(self): return schema_from_arrow(self._arrow_schema)
+
+    def check_lossless(self) -> None:
+        """Nanosecond timestamps in files are read as microseconds; refuse values that would be cut.
+        Only nanosecond columns are scanned, once per file version."""
+        import os
+
+        import pyarrow.compute as pc
+        if not self.paths:
+            return
+        ns = [f.name for f in self._arrow_schema if pa.types.is_timestamp(f.type) and f.type.unit == "ns"]
+        if not ns:
+            return
+        stamp = tuple((p, os.stat(p).st_mtime_ns, os.stat(p).st_size) for p in self.paths)
+        if getattr(self, "_lossless_ok", None) == stamp:
+            return
+        for path in self.paths:
+            table = pq.read_table(path, columns=ns)
+            for name in ns:
+                v = pc.cast(table.column(name), pa.int64())
+                if pc.any(pc.not_equal(pc.subtract(v, pc.multiply(pc.divide(v, 1000), 1000)), 0)).as_py():
+                    raise UnsupportedTypeError(
+                        f"Column '{name}' in {path} has nanosecond timestamps; pyursa keeps microseconds, "
+                        "which would cut them.", details={"column": name, "file": path},
+                        suggestions=[{"description": "Round the timestamps to microseconds when writing the file, "
+                                                     "or store them as Int64 nanoseconds."}])
+        self._lossless_ok = stamp
 
     def needs_cast(self, name: str) -> bool:
         """True when a file column's stored type differs from its declared type (e.g. int32, float32,

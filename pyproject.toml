@@ -32,12 +32,12 @@ dependencies = ["pyarrow>=15"]
 
 [project.optional-dependencies]
 polars = ["polars>=1.30"]
-duckdb = ["duckdb>=1.2"]
-all = ["polars>=1.30", "duckdb>=1.2"]
-mcp = ["mcp>=1.21.1", "polars>=1.30", "duckdb>=1.2"]
+duckdb = ["duckdb>=1.4"]
+all = ["polars>=1.30", "duckdb>=1.4"]
+mcp = ["mcp>=1.21.1", "polars>=1.30", "duckdb>=1.4"]
 llm = ["anthropic>=0.40"]
 bedrock = ["boto3>=1.34"]
-dev = ["polars>=1.30", "duckdb>=1.2", "pytest>=8", "mcp>=1.21.1", "numpy", "pandas", "botocore", "ruff", "build", "twine"]
+dev = ["polars>=1.30", "duckdb>=1.4", "pytest>=8", "mcp>=1.21.1", "numpy", "pandas", "botocore", "ruff", "build", "twine"]
 
 [project.urls]
 Homepage = "https://github.com/karawash-projects/pyursa"

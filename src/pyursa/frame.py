@@ -499,5 +499,15 @@ def read_csv(path: str, name: str | None = None, *, empty_as_null: bool = True,
         column_types={n: DType(t).to_arrow() for n, t in (schema or {}).items()} or None,
     )
     parse = pcsv.ParseOptions(delimiter=delimiter)
-    return from_arrow(pcsv.read_csv(path, parse_options=parse, convert_options=opts),
-                      name or os.path.splitext(os.path.basename(path))[0])
+    try:
+        table = pcsv.read_csv(path, parse_options=parse, convert_options=opts)
+    except pa.ArrowInvalid as e:
+        raise InvalidOperationError(f"Can't read {os.path.basename(str(path))} as CSV: {e}", code="CAST_FAILED",
+                                    details={"path": str(path)},
+                                    suggestions=[{"description": "Check the schema= types against the file's values, "
+                                                                 "or read the column as String and cast it."}]) from None
+    if not empty_as_null:  # a column of only empty fields: keep the empty text instead of an all-null column
+        for i, f in enumerate(table.schema):
+            if pa.types.is_null(f.type) and f.name not in (schema or {}):
+                table = table.set_column(i, f.name, pa.array([""] * table.num_rows, pa.string()))
+    return from_arrow(table, name or os.path.splitext(os.path.basename(str(path)))[0])

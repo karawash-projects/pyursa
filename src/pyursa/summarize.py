@@ -98,7 +98,13 @@ def profile(frame: "Frame", backend: str | None = None, top_k: int = 3,
         columns.append(info)
 
     for n in names:
-        if _INJECTION.search(str(n)) or "\n" in str(n):
+        nested = _nested_names(schema[n])
+        for fname in nested:
+            if _INJECTION.search(fname) or _one_line(fname) != fname:
+                warnings.append(f"A field name inside column {_short(str(n), 40)!r} looks like instructions to an AI "
+                                f"or contains a line break: {_short(fname, 60)!r}.")
+                break
+        if _INJECTION.search(str(n)) or _one_line(str(n)) != str(n):
             warnings.append(f"Column name {_short(str(n), 60)!r} looks like instructions to an AI or contains a line break.")
     for src in sources(frame.plan):
         if _INJECTION.search(str(src.name)) or "\n" in str(src.name):
@@ -137,10 +143,30 @@ def _short(v: str, n: int) -> str:
     return v if len(v) <= n else v[: n - 1] + "…"
 
 
+_LINE_BREAKS = {"\r": " ", "\n": "⏎", "\u2028": "⏎", "\u2029": "⏎", "\x0b": " ", "\x0c": " ",
+                "\x1c": " ", "\x1d": " ", "\x1e": " ", "\x85": "⏎"}
+
+
+def _nested_names(t: Any) -> list[str]:
+    out: list[str] = []
+    if getattr(t, "kind", None) == "Struct":
+        for fname, ft in t.fields or ():
+            out.append(str(fname))
+            out += _nested_names(ft)
+    elif getattr(t, "kind", None) == "List":
+        out += _nested_names(t.inner)
+    return out
+
+
+def _one_line(s: str) -> str:
+    """Replace every character that some reader treats as a line break."""
+    return s.translate(str.maketrans(_LINE_BREAKS))
+
+
 def _name(n: Any, width: int = 60) -> str:
     """A column or dataset name made safe for one markdown table cell: names come from file headers,
     so they are untrusted text like any cell value."""
-    s = str(n).replace("\r", " ").replace("\n", "⏎").replace("|", "\\|").replace("`", "'")
+    s = _one_line(str(n)).replace("|", "\\|").replace("`", "'")
     return _short(s, width)
 
 
@@ -162,7 +188,7 @@ def _cell(v: Any, width: int = 28, exact: bool = False) -> str:
     if isinstance(v, _decimal.Decimal):
         return str(v)
     if isinstance(v, str):
-        s = v.replace("\r", " ").replace("\n", "⏎").replace("|", "\\|").replace("`", "'")
+        s = _one_line(v).replace("|", "\\|").replace("`", "'")
         return '"' + _short(s, width) + '"'
     if isinstance(v, (list, dict)):
         import json as _json
@@ -185,7 +211,7 @@ def render(p: dict[str, Any], level: int, max_cols: int | None = None) -> str:
         out.append("| column | type | nulls |")
         out.append("|---|---|---|")
         for c in cols:
-            out.append(f"| {_name(c['name'])} | {c['dtype']} | {c['nulls']:,} |")
+            out.append(f"| {_name(c['name'])} | {_name(c['dtype'], 80)} | {c['nulls']:,} |")
     else:
         head = "| column | type | nulls | distinct | min | max | mean |"
         sep = "|---|---|---|---|---|---|---|"
@@ -194,7 +220,7 @@ def render(p: dict[str, Any], level: int, max_cols: int | None = None) -> str:
         out += [head, sep]
         for c in cols:
             distinct = "" if c["distinct"] is None else f"{c['distinct']:,}"
-            row = (f"| {_name(c['name'])} | {c['dtype']} | {c['nulls']:,} | {distinct} | "
+            row = (f"| {_name(c['name'])} | {_name(c['dtype'], 80)} | {c['nulls']:,} | {distinct} | "
                    f"{_cell(c.get('min')) if 'min' in c else ''} | {_cell(c.get('max')) if 'max' in c else ''} | "
                    f"{_cell(c.get('mean')) if 'mean' in c else ''} |")
             if level >= 2:
@@ -226,7 +252,7 @@ def describe_for_llm(frame: "Frame", tokens: int = 800, backend: str | None = No
         text = render(p, 0, max_cols=k)
         if count_tokens(text) <= tokens:
             return text
-    text = f"Dataset `{p['name']}`: {p['rows']:,} rows × {p['n_columns']} columns."
+    text = f"Dataset `{_name(p['name'])}`: {p['rows']:,} rows × {p['n_columns']} columns."
     while count_tokens(text) > tokens and len(text) > 1:
         text = text[: max(1, len(text) - 8)]
     return text

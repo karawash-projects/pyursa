@@ -136,11 +136,17 @@ Subclass `pu.PromptClient` and implement `complete(system, user) -> str` (option
 - A failed model call costs only its own rows: they come back as null and are counted in
   `failed_items` / `failed_calls`, with the provider's message in `errors`. Every other answer is kept
   and cached. If no answer comes back at all, the step raises the provider's error.
-- Collecting the same frame again reuses its answers and retries failed rows. Inside `ToolSession` /
-  the MCP server, previews, counts and summaries of a frame reuse its results, failed rows included,
-  so an agent looking at a frame several times doesn't pay again; running the step again retries.
+- Rows without a valid answer are null in `llm_map`/`llm_extract` and dropped by `llm_filter` (an unknown
+  condition counts as false). Either way an `LLMPartialFailureWarning` is raised, and tool results
+  (`preview`, `count_rows`) carry an `llm_warnings` list.
+- Collecting a frame again re-runs its LLM steps: good answers come from the cache and failed rows are
+  retried. Inside `ToolSession` / the MCP server, previews, counts and summaries of a frame reuse its
+  results, failed rows included, so an agent looking at a frame several times doesn't pay again, as long
+  as the source files haven't changed; running the step again retries.
 - The in-memory cache keeps the most recent 200,000 answers (`LLMCache(max_entries=...)`); a cache
   file (`set_llm(cache_path=...)`) keeps everything.
-- `FunctionClient` caches are keyed by the function's code and the values it captures, so two
-  functions that could answer differently never share answers. Pass `model_id=` to name it yourself.
+- `FunctionClient` caches are keyed by the function's code and everything it reads (closure values,
+  defaults, globals, an instance's attributes), so two functions that could answer differently never
+  share answers. When any of that isn't a plain value (an array, a data frame, a model object), the
+  client gets a one-off id and nothing is shared; pass `model_id=` to name it yourself.
 

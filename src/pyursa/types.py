@@ -403,17 +403,44 @@ def normalize_tz(tz: str | None) -> str | None:
 
 
 def _check_zone(tz: str) -> None:
-    """Reject time-zone names that don't exist (when a time-zone database is available to check)."""
+    """Reject time-zone names that don't exist. A name counts as valid if Python's time-zone database or
+    an installed engine knows it: some systems ship tzdata without legacy aliases such as 'US/Eastern',
+    which the engines still accept."""
     import zoneinfo
     try:
         zoneinfo.ZoneInfo(tz)
+        return
     except (zoneinfo.ZoneInfoNotFoundError, ValueError):
-        if tz.upper() == "UTC" or not zoneinfo.available_timezones():  # no tz database here: can't check
-            return
-        raise UnsupportedTypeError(
-            f"Unknown time zone {tz!r}.",
-            suggestions=[{"description": "Use an IANA zone name such as 'UTC', 'America/Toronto' or 'Europe/Paris'."}],
-        ) from None
+        pass
+    if tz.upper() == "UTC" or not zoneinfo.available_timezones() or _engine_knows_zone(tz):
+        return
+    raise UnsupportedTypeError(
+        f"Unknown time zone {tz!r}.",
+        suggestions=[{"description": "Use an IANA zone name such as 'UTC', 'America/Toronto' or 'Europe/Paris'."}],
+    ) from None
+
+
+def _engine_knows_zone(tz: str) -> bool:
+    try:
+        import polars as pl
+    except ImportError:
+        pl = None
+    if pl is not None:
+        try:
+            pl.Series([0]).cast(pl.Datetime("us", "UTC")).dt.convert_time_zone(tz)
+            return True
+        except Exception:
+            return False
+    try:
+        import duckdb
+        con = duckdb.connect()
+        try:
+            con.execute("SELECT CAST('2024-01-01 00:00:00+00' AS TIMESTAMPTZ) AT TIME ZONE $tz", {"tz": tz}).fetchall()
+            return True
+        finally:
+            con.close()
+    except Exception:
+        return True  # no engine to ask: don't reject a name we can't check
 
 
 def tz_name(tzinfo: Any) -> str | None:

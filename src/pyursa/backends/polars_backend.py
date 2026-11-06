@@ -129,7 +129,11 @@ class PolarsBackend(Backend):
                                      use_statistics=stats)
                 # Files keep their own types (category, int32, float32, ms timestamps); conform them to the
                 # declared schema so every later step sees the same types as on DuckDB and in memory.
-                fixes = {n: _pl_dtype(t) for n, t in node.schema.items() if node.needs_cast(n)}
+                # compare with what Polars itself reads (it reads some types differently from the Arrow
+                # schema, e.g. date64 as Datetime(ms))
+                read = lf.collect_schema()
+                fixes = {n: _pl_dtype(t) for n, t in node.schema.items()
+                         if node.needs_cast(n) or (n in read and read[n] != _pl_dtype(t))}
                 return lf.cast(fixes, strict=True) if fixes else lf
             return pl.from_arrow(node.table).lazy()
         if isinstance(node, P.Filter):

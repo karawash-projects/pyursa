@@ -46,6 +46,10 @@ class LLMNotConfiguredError(PyursaError):
     code = "LLM_NOT_CONFIGURED"
 
 
+class LLMPartialFailureWarning(UserWarning):
+    """Some rows of an llm_* step got no valid answer (they are null, or dropped by llm_filter)."""
+
+
 class LLMBudgetError(PyursaError):
     code = "LLM_BUDGET_EXCEEDED"
 
@@ -73,62 +77,91 @@ class LLMClient:
         raise NotImplementedError
 
 
-_SIMPLE = (int, float, complex, str, bytes, bool, type(None), _decimal_mod.Decimal, _dt.date, _dt.datetime, _dt.time)
+_SIMPLE = (int, float, complex, str, bytes, bool, type(None), _decimal_mod.Decimal, _dt.date, _dt.datetime, _dt.time,
+           _dt.timedelta)
 
 
 def _stable_repr(v: Any, depth: int = 0) -> str | None:
-    """A description of a value that is the same in every process, or None if there isn't one."""
-    if depth > 6:
+    """A complete description of a value that is the same in every process, or None if there isn't one.
+    Only plain values qualify (numbers, text, dates, and lists/tuples/dicts/sets of them), functions
+    (described by their own identity) and modules. Anything else, such as arrays, data frames or objects
+    with custom state, gives None: their printed form can hide or truncate the data."""
+    if depth > 8:
         return None
-    if isinstance(v, _SIMPLE):
+    if isinstance(v, _SIMPLE) and type(v) in _SIMPLE:
         return f"{type(v).__qualname__}:{v!r}"
-    if isinstance(v, (list, tuple, set, frozenset)):
+    if type(v) in (list, tuple, set, frozenset):
         items = [_stable_repr(x, depth + 1) for x in v]
         if any(i is None for i in items):
             return None
-        return f"{type(v).__qualname__}[{','.join(sorted(items) if isinstance(v, (set, frozenset)) else items)}]"
-    if isinstance(v, dict):
+        return f"{type(v).__qualname__}[{','.join(sorted(items) if type(v) in (set, frozenset) else items)}]"
+    if type(v) is dict:
         items = [(_stable_repr(k, depth + 1), _stable_repr(x, depth + 1)) for k, x in v.items()]
         if any(a is None or b is None for a, b in items):
             return None
         return "dict{" + ",".join(sorted(f"{a}={b}" for a, b in items)) + "}"
     if inspect.ismodule(v):
         return f"module:{v.__name__}"
-    if callable(v):
+    if inspect.isfunction(v) or inspect.ismethod(v) or inspect.isbuiltin(v):
         ident = _callable_identity(v, depth + 1)
         return None if ident is None else f"callable:{ident}"
-    r = repr(v)
-    return None if " at 0x" in r or r.startswith("<") else f"{type(v).__module__}.{type(v).__qualname__}:{r}"
+    return None
 
 
 def _code_identity(code: Any) -> str:
-    consts = [(_code_identity(c) if inspect.iscode(c) else repr(c)) for c in code.co_consts]
-    return repr((code.co_code, consts, code.co_names, code.co_varnames))
+    def const(c: Any) -> str:
+        if inspect.iscode(c):
+            return _code_identity(c)
+        if isinstance(c, frozenset):  # set literals: element order depends on the hash seed
+            return "frozenset{" + ",".join(sorted(const(x) for x in c)) + "}"
+        if isinstance(c, tuple):
+            return "(" + ",".join(const(x) for x in c) + ")"
+        return f"{type(c).__qualname__}:{c!r}"
+    return repr((code.co_code, [const(c) for c in code.co_consts], code.co_names, code.co_varnames))
+
+
+def _object_state(obj: Any, depth: int) -> str | None:
+    """Every attribute of an object (__dict__ and __slots__), or None if any isn't a plain value."""
+    state: dict[str, Any] = dict(getattr(obj, "__dict__", {}) or {})
+    for klass in type(obj).__mro__:
+        for name in getattr(klass, "__slots__", ()) or ():
+            if isinstance(name, str) and name not in ("__dict__", "__weakref__") and hasattr(obj, name):
+                state[name] = getattr(obj, name)
+    return _stable_repr(state, depth + 1)
 
 
 def _callable_identity(fn: Any, depth: int = 0) -> str | None:
-    if depth > 6:
+    """Code plus everything the callable can read: closure cells, defaults, referenced globals and, for
+    methods and callable objects, the instance's state. None when any of it can't be described exactly."""
+    if depth > 8:
         return None
     if inspect.ismethod(fn):  # bound method: the function plus the instance it is bound to
-        inner, owner = _callable_identity(fn.__func__, depth + 1), _stable_repr(fn.__self__, depth + 1)
-        return None if inner is None or owner is None else f"method({inner};{owner})"
+        inner, owner = _callable_identity(fn.__func__, depth + 1), _object_state(fn.__self__, depth + 1)
+        return None if inner is None or owner is None else f"method({inner};{type(fn.__self__).__qualname__};{owner})"
     if inspect.isfunction(fn):
         parts = [f"{fn.__module__}.{fn.__qualname__}", _code_identity(fn.__code__)]
-        captured = [c.cell_contents for c in (fn.__closure__ or ()) if _cell_has_value(c)]
+        captured: list[Any] = [c.cell_contents for c in (fn.__closure__ or ()) if _cell_has_value(c)]
         captured += list(fn.__defaults__ or ()) + sorted((fn.__kwdefaults__ or {}).items())
-        captured += [(n, fn.__globals__[n]) for n in fn.__code__.co_names
-                     if n in fn.__globals__ and isinstance(fn.__globals__[n], _SIMPLE + (list, tuple, dict, set))]
+        g = fn.__globals__
+        names = sorted(_referenced_names(fn.__code__))
+        captured += [(n, g[n]) for n in names if n in g and not (inspect.isfunction(g[n]) and g[n] is fn)]
         r = _stable_repr(captured, depth + 1)
         return None if r is None else "|".join(parts + [r])
     if inspect.isbuiltin(fn):
         return f"builtin:{getattr(fn, '__module__', '')}.{fn.__qualname__}"
-    call = type(fn).__dict__.get("__call__") or next(
-        (k.__dict__["__call__"] for k in type(fn).__mro__ if "__call__" in k.__dict__), None)
+    call = next((k.__dict__["__call__"] for k in type(fn).__mro__ if "__call__" in k.__dict__), None)
     if call is not None and inspect.isfunction(call):  # callable object: its class, __call__ and its state
-        inner = _callable_identity(call, depth + 1)
-        state = _stable_repr(getattr(fn, "__dict__", {}), depth + 1)
-        return None if inner is None or state is None else f"object({inner};{state})"
+        inner, state = _callable_identity(call, depth + 1), _object_state(fn, depth + 1)
+        return None if inner is None or state is None else f"object({type(fn).__qualname__};{inner};{state})"
     return None
+
+
+def _referenced_names(code: Any) -> set[str]:
+    names = set(code.co_names)
+    for c in code.co_consts:
+        if inspect.iscode(c):
+            names |= _referenced_names(c)
+    return names
 
 
 def _cell_has_value(cell: Any) -> bool:
@@ -151,11 +184,11 @@ class FunctionClient(LLMClient):
     `fn(row) -> dict | scalar`; a scalar is used for single-field tasks."""
 
     def __init__(self, fn: Callable[[dict[str, Any]], Any], model_id: str | None = None) -> None:
-        """model_id names the function in cache keys. By default it is derived from the function's code
-        and the values it captures (closure cells, defaults, bound instance, simple globals), so two
-        functions that could answer differently never share cached answers. When a captured value has no
-        stable description (e.g. an object without a meaningful repr), the client gets a unique id and
-        its answers are never reused by another client; pass model_id to share a persistent cache."""
+        """model_id names the function in cache keys. By default it is derived from the function's code and
+        everything it can read (closure cells, defaults, referenced globals, a bound instance's attributes),
+        so two functions that could answer differently never share cached answers. When any of that isn't a
+        plain value (an array, a data frame, a model object, ...), the client gets a unique id and its
+        answers are never reused by another client. Pass model_id to share answers (e.g. a cache file)."""
         self.fn = fn
         if model_id is None:
             ident = _callable_identity(fn)
@@ -519,6 +552,22 @@ def execute(node: Node, backend) -> pa.Table:
 _RESULTS: "weakref.WeakKeyDictionary[Node, tuple]" = weakref.WeakKeyDictionary()
 
 
+def _files_fingerprint(node: Node) -> tuple:
+    """Size and modification time of every file the step reads, so reuse stops when a file changes."""
+    import os
+
+    from .plan import sources
+    out = []
+    for src in sources(node):
+        for path in getattr(src, "paths", None) or []:
+            try:
+                st = os.stat(path)
+                out.append((path, st.st_size, st.st_mtime_ns))
+            except OSError:
+                out.append((path, None, None))
+    return tuple(out)
+
+
 class reuse_llm_results:
     """Context manager: within it, re-executing a frame reuses its LLM step results, failures included."""
 
@@ -536,14 +585,12 @@ def _materialize(node: Node, backend) -> Node:
     if getattr(node, "semantic", False):
         cfg = node.config or CONFIG
         client = node.client or cfg.client
-        fingerprint = (id(cfg), id(client), getattr(client, "model_id", None), id(cfg.cache))
+        fingerprint = (id(cfg), id(client), getattr(client, "model_id", None), id(cfg.cache), _files_fingerprint(node))
         done = _RESULTS.get(node)
-        if done is not None and done[0] == fingerprint and (
-                getattr(_LOCAL, "reuse_failed", False) or not done[2].get("failed_items")):
-            # this step already ran for this frame: reuse its answers instead of calling the model again.
-            # Inside tool sessions (preview, count, describe...) failed rows are reused too, so an agent's
-            # repeated looks don't re-send them; it retries by running the step again. Plain collect()
-            # retries failed rows.
+        if done is not None and done[0] == fingerprint and getattr(_LOCAL, "reuse_failed", False):
+            # Inside tool sessions, previews, counts and summaries of a frame reuse its LLM step results
+            # (failed rows included) instead of calling the model again; the source files must be
+            # unchanged. Plain collect() always re-runs the step (answers still come from the cache).
             reused = {**done[2], "reused": True, "llm_calls": 0, "llm_items": 0, "input_tokens": 0, "output_tokens": 0,
                       "cache_hits": done[2].get("unique_rows", 0), "failed_calls": 0, "errors": []}
             if "cost_usd" in reused:
@@ -677,6 +724,11 @@ def run_semantic(node: SemanticOp, table: pa.Table) -> pa.Table:
     if not hasattr(_LOCAL, "reports"):
         _LOCAL.reports = []
     _LOCAL.reports.append(report)
+    if failures:
+        import warnings
+        what = "were dropped (unknown counts as false)" if node.kind == "filter" else "are null"
+        warnings.warn(f"{node.op}(): {failures:,} of {len(unique):,} unique rows got no valid answer and {what}. "
+                      f"See pu.llm_reports() for the errors.", LLMPartialFailureWarning, stacklevel=2)
 
     results = [answers[k] for k in keys]
     if node.kind == "filter":

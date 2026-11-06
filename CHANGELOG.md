@@ -61,6 +61,32 @@ verifying it. Several bugs returned wrong answers without an error; upgrading is
 - Unknown time zones and offsets outside -12:00..+14:00 are rejected; fixed offsets are normalized in every
   `Datetime` type. `describe_for_llm` has its docstring again; paste-ready fixes quote column names safely.
 
+### Fixed (independent re-review of the fixes)
+- Reusing LLM results could return stale rows after a source file changed; reuse now happens only inside
+  tool sessions and only while the files are unchanged. Plain `collect()` always re-runs the step.
+- `FunctionClient` ids ignored state they couldn't print exactly (NumPy arrays, pandas objects, objects
+  with custom `__repr__` or `__slots__`, global helpers and objects); such functions now get a one-off id.
+  Ids no longer depend on the hash seed.
+- Parquet `date64` columns were read as datetimes on Polars.
+- Nanosecond timestamps in Parquet files were silently cut to microseconds; values with sub-microsecond
+  parts now raise `UNSUPPORTED_TYPE`, like in-memory data.
+- Struct field names and line-separator characters (U+2028/U+2029 and others) could inject lines into
+  `describe_for_llm`; the smallest summary printed the dataset name unescaped.
+- Time-zone aliases such as `US/Eastern` were rejected on systems whose tz database lacks them.
+- `llm_filter` dropped rows whose model call failed without telling anyone; this now raises an
+  `LLMPartialFailureWarning`, and tool results include `llm_warnings`.
+- Loading a folder failed if it contained a hidden file; hidden files and links to them are skipped.
+- Glob patterns followed symlinked folders out of the root (revealing file names and walking the
+  target); patterns no longer leave the roots and visit at most 200,000 entries.
+- On Windows, a pattern such as `/**/*` is rooted but not absolute and was expanded against the drive.
+- On Polars 2.1 the decimal overflow check was optimized away.
+- `read_csv(empty_as_null=False)` turned a column of empty fields into nulls; `schema=` conversion errors
+  are structured errors.
+- DuckDB 1.2 and 1.3 returned rows in a different order for filters with `|` or `is_in`, and a different
+  median when NaN and infinity were present. **The minimum DuckDB version is now 1.4.**
+- Remaining engine differences (Polars 1.x decimal limits, `-0.0` vs `0.0`) are listed in
+  `pu.SEMANTICS["known_differences"]`.
+
 ### Changed
 - Development status is back to Beta until a follow-up review comes back clean.
 - The version is defined once (`pyursa.__version__`); releases check that the tag matches and run the tests.
