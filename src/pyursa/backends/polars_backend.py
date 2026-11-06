@@ -80,7 +80,7 @@ def _checked_decimal(result, approx, mag, scale: int):
     off = (result.cast(pl.Float64) - approx).abs() > mag * 1e-9 + 1e-300
     too_long = (result > _max_decimal(scale)) | (result < -_max_decimal(scale))
     guard = _overflow_guard(result.is_not_null() & (off | too_long))
-    return pl.when(guard == 0).then(result).otherwise(result)
+    return pl.when(guard == 0).then(result).otherwise(None)  # distinct branches: the guard can't be optimized away
 
 
 def _exact_decimal_product(l, lt: DType, r, rt: DType, scale: int):
@@ -102,7 +102,7 @@ def _exact_decimal_product(l, lt: DType, r, rt: DType, scale: int):
     too_long = (prod > _max_decimal(scale)) | (prod < -_max_decimal(scale))
     bad = l.is_not_null() & r.is_not_null() & (prod.is_null() | wrapped | too_long)
     guard = _overflow_guard(bad)
-    return pl.when(guard == 0).then(prod).otherwise(prod)
+    return pl.when(guard == 0).then(prod).otherwise(None)  # distinct branches: the guard can't be optimized away
 
 
 class PolarsBackend(Backend):

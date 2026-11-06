@@ -271,6 +271,13 @@ class ToolSession:
                 raise SandboxError(f"Patterns can't contain '..': '{path}'.",
                                    suggestions=[{"description": "Use a pattern relative to the data folder, e.g. 'sales/*.parquet'."}])
             root, rel = self.roots[0], path
+            if not Path(path).is_absolute() and (Path(path).anchor or path.startswith(("/", "\\"))):
+                # e.g. "/**/*" or "C:*" on Windows: rooted but not absolute, which glob would expand
+                # against the current drive instead of the data folder
+                raise SandboxError(
+                    f"Pattern '{path}' is outside the allowed directories.",
+                    details={"allowed_roots": [str(r) for r in self.roots]},
+                    suggestions=[{"description": "Use a pattern relative to the data folder, e.g. 'sales/*.parquet'."}])
             if Path(path).is_absolute():
                 root = next((r for r in self.roots if Path(path).parts[:len(r.parts)] == r.parts), None)
                 if root is None:
@@ -279,6 +286,9 @@ class ToolSession:
                         details={"allowed_roots": [str(r) for r in self.roots]},
                         suggestions=[{"description": "Use a pattern relative to the data folder, e.g. 'sales/*.parquet'."}])
                 rel = str(Path(*Path(path).parts[len(root.parts):]))
+            if Path(rel).anchor or os.path.isabs(rel):  # never let glob leave root_dir
+                raise SandboxError(f"Pattern '{path}' is outside the allowed directories.",
+                                   details={"allowed_roots": [str(r) for r in self.roots]})
             matches = []
             for m in _glob.iglob(rel, root_dir=root, recursive=True):
                 matches.append(m)

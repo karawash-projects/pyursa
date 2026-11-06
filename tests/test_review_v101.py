@@ -108,7 +108,7 @@ def test_read_only_by_default(root):
     assert w.export(h, "out.parquet")["rows"] == 2
 
 
-@pytest.mark.parametrize("pattern", ["/etc/pass*", "/usr/**/*.x", "../*", "../**/*.parquet", "/**/*"])
+@pytest.mark.parametrize("pattern", ["/etc/pass*", "/usr/**/*.x", "../*", "../**/*.parquet", "/**/*", "\\\\**\\\\*", "\\\\x*"])
 def test_patterns_never_look_outside_roots(root, pattern):
     s = ToolSession(roots=[root])
     t = time.time()
